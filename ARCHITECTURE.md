@@ -67,12 +67,7 @@ Encrypt = `scramble` → `additive_share`.
 `rrwei_sm/hua_scrambling.py` (`scrambler="hua"`, 2D Logistic-Sine
 Coupling Map, Hua et al. 2018).
 
-```
-cover (uint8, H, W)
-        │  permute 2×2 blocks with key_scramble
-        ▼
-scrambled (uint8, H, W)
-```
+![Block-level scrambling illustration](assets/block-level-scrambling-1.png)
 
 - The image is reshaped to `(H/2, W/2, 2, 2)`, giving `H*W/4` blocks.
 - A pseudo-random permutation of block indices is generated from
@@ -90,12 +85,7 @@ positions with the plaintext. The scramble key is part of the
 
 **Where:** `rrwei_sm/secret_sharing.py`.
 
-```
-scrambled (uint8)
-        │  seed = key_share
-        ▼
-share_1, share_2, …, share_k  (int32, H, W)   s.t.  sum == scrambled
-```
+![Additive secret sharing illustration](assets/additive-secret-sharing-1.png)
 
 The pipeline:
 
@@ -168,15 +158,7 @@ sequence:
 
 **Stage 1 — Patchwork (robust watermark)**  `rrwei_sm/patchwork.py`
 
-```
-combined (int64, H, W)
-        │  reshape into (N_blocks, 2m) pixel blocks
-        │  per-block random split into two halves  (Eq. 23)
-        │  shift one half +T, the other -T        (Eq. 24)
-        │  sign of shift carries the robust bit   (Eq. 25)
-        ▼
-patchwork_marked (int64, H, W)   +  PatchworkSideInfo
-```
+![Patchwork embedding illustration.](assets/patchwork-1.png)
 
 - `m` = patchwork half-size (default 4 → 8-pixel blocks).
 - `T` = perturbation amount. When `patchwork_plane == "hsb"`, `T` is
