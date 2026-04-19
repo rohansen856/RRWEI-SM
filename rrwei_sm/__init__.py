@@ -1,78 +1,41 @@
-"""
-RRWEI-SM: Robust Reversible Watermarking in Encrypted Image with Secure Multi-Party
-based on Lightweight Cryptography.
+"""Robust Reversible Watermarking in Encrypted Image: modern rewrite.
 
-Python implementation of:
-    Xiong, Han, Yang, Shi. "Robust Reversible Watermarking in Encrypted Image
-    With Secure Multi-Party Based on Lightweight Cryptography." IEEE Trans.
-    Circuits Syst. Video Technol., vol. 32, no. 1, Jan. 2022.
+Public surface (import-through re-export):
 
-Public API
-----------
-- RRWEISM: the basic scheme (additive secret sharing + PEE on HSB).
-- ModifiedRRWEISM: the two-stage scheme (patchwork robust + PEE reversible).
-- encrypt/decrypt helpers, PEE primitives, scrambling primitives.
-- Metric helpers (psnr, ber) exposed via utils.
+* :class:`ModernScheme`  -- end-to-end orchestrator
+* :mod:`attacks`         -- classical + modern attack suite
+* :mod:`coding`          -- rANS side-info coder
+* :mod:`crypto_scrambler` -- ChaCha20 block scrambler
+* :mod:`metrics`         -- PSNR / SSIM / LPIPS / DISTS
+* :mod:`pvo`             -- PVO + pairwise PEE reversible predictor
+* :mod:`secret_sharing`  -- keystream-based additive sharing (2-of-2)
+* :mod:`stdm`            -- spread-transform dither modulation robust WM
+* :mod:`threshold_sharing` -- (k, n) replicated threshold sharing
 """
 
-from .secret_sharing import (
-    additive_share_image,
-    additive_share_image_k,
-    additive_combine_shares,
-    additive_combine_shares_k,
-    split_hsb_lsb,
-    recombine_hsb_lsb,
+from __future__ import annotations
+
+from . import (
+    attacks,
+    coding,
+    crypto_scrambler,
+    metrics,
+    pvo,
+    secret_sharing,
+    stdm,
+    threshold_sharing,
 )
-from .scrambling import (
-    block_scramble,
-    block_unscramble,
-    generate_scramble_permutation,
-)
-from .hua_scrambling import hua_scramble, hua_unscramble, HuaKey
-from .pee import PEEEmbedder, PEEExtractor
-from .patchwork import PatchworkEmbedder, PatchworkExtractor
-from .rrwei_sm import RRWEISM
-from .modified_rrwei_sm import ModifiedRRWEISM
-from .utils import psnr, ber, ssim_simple, bits_to_bytes, bytes_to_bits
-from .metrics import (
-    npcr,
-    uaci,
-    npcr_report,
-    pixel_correlation,
-    correlation_report,
-    pee_capacity_bpp,
-)
-from . import attacks
+from .orchestrator import EmbedResult, ModernScheme
 
 __all__ = [
-    "RRWEISM",
-    "ModifiedRRWEISM",
-    "PEEEmbedder",
-    "PEEExtractor",
-    "PatchworkEmbedder",
-    "PatchworkExtractor",
-    "additive_share_image",
-    "additive_share_image_k",
-    "additive_combine_shares",
-    "additive_combine_shares_k",
-    "split_hsb_lsb",
-    "recombine_hsb_lsb",
-    "block_scramble",
-    "block_unscramble",
-    "generate_scramble_permutation",
-    "hua_scramble",
-    "hua_unscramble",
-    "HuaKey",
-    "psnr",
-    "ber",
-    "ssim_simple",
-    "bits_to_bytes",
-    "bytes_to_bits",
-    "npcr",
-    "uaci",
-    "npcr_report",
-    "pixel_correlation",
-    "correlation_report",
-    "pee_capacity_bpp",
+    "ModernScheme",
+    "EmbedResult",
     "attacks",
+    "coding",
+    "crypto_scrambler",
+    "metrics",
+    "pvo",
+    "secret_sharing",
+    "stdm",
+    "threshold_sharing",
 ]
