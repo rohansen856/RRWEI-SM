@@ -59,7 +59,7 @@ __all__ = [
     "apply_owner_delta",
 ]
 
-_INFO_RSS = b"rrwei_sm_modern/rss/mask/v1"
+_INFO_RSS = b"rrwei_sm/rss/mask/v1"
 
 
 @dataclass

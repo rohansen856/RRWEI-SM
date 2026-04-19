@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from rrwei_sm_modern.threshold_sharing import (
+from rrwei_sm.threshold_sharing import (
     ReplicatedShares,
     apply_owner_delta,
     combine,
