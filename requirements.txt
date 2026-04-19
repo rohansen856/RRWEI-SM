@@ -1,3 +1,17 @@
 numpy>=1.24
 pillow>=10.0
 pytest>=7.4
+matplotlib>=3.7
+cryptography>=42.0
+pywavelets>=1.5
+zstandard>=0.22
+constriction>=0.3
+numba>=0.59
+scikit-image>=0.22
+scipy>=1.11
+requests>=2.31
+# Torch family: install from https://download.pytorch.org/whl/cpu
+# to avoid ABI mismatches with torchvision.
+torch>=2.2
+torchvision>=0.17
+lpips>=0.1.4
