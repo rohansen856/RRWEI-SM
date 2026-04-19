@@ -111,7 +111,37 @@ def main() -> int:
     if "rrwei_sm_modern.stdm" in imported:
         _step2_stdm_robustness()
 
+    if "rrwei_sm_modern.coding" in imported:
+        _step3_rans_roundtrip()
+
     return 0
+
+
+def _step3_rans_roundtrip() -> None:
+    """Step 3 gate: rANS round-trip + compression ratio demo."""
+    import zlib
+
+    from rrwei_sm_modern.coding import decode_symbols, encode_symbols, estimate_pmf
+
+    rng = np.random.default_rng(0)
+    n = 4096
+    # Simulate bimodal side information (typical PVO / STDM residuals).
+    symbols = rng.choice([-4, 4], size=n, p=[0.5, 0.5])
+    symbols = symbols + rng.integers(-1, 2, size=n)
+    pmf = estimate_pmf(symbols + 5, alphabet_size=11)
+    coded = encode_symbols(symbols, pmf, alphabet_offset=-5)
+    decoded = decode_symbols(coded.blob)
+    assert (decoded == symbols).all()
+
+    raw_bits = 8 * symbols.size * 2  # int16 baseline
+    zlib_bits = 8 * len(zlib.compress(symbols.astype("<i2").tobytes(), level=9))
+    rans_bits = 8 * len(coded.blob)
+    print("\n== Step 3: rANS side-info coder ==")
+    print(
+        f"  bimodal payload n={n}: int16={raw_bits} bits, "
+        f"zlib={zlib_bits} bits, rANS={rans_bits} bits "
+        f"(rANS/zlib = {rans_bits / max(zlib_bits, 1):.2f})"
+    )
 
 
 if __name__ == "__main__":
