@@ -50,8 +50,8 @@ __all__ = [
 ]
 
 
-_CHACHA_INFO_PERM = b"rrwei_sm_modern/permutation/v1"
-_CHACHA_INFO_MASK = b"rrwei_sm_modern/additive_mask/v1"
+_CHACHA_INFO_PERM = b"rrwei_sm/permutation/v1"
+_CHACHA_INFO_MASK = b"rrwei_sm/additive_mask/v1"
 
 
 @dataclass(frozen=True)

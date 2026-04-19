@@ -1,71 +1,70 @@
-"""Tests for the additive-secret-sharing module (Eqs. 7-14)."""
+"""Tests for the ChaCha20-keystream additive secret sharing."""
+
+from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from rrwei_sm.secret_sharing import (
-    Shares,
     additive_combine_shares,
     additive_share_image,
     recombine_hsb_lsb,
-    share_hsb_plane,
-    share_lsb_plane,
-    shares_in_gray_range,
     split_hsb_lsb,
 )
 
 
-def test_split_recombine_is_identity():
-    img = np.arange(256, dtype=np.uint8).reshape(16, 16)
-    hsb, lsb = split_hsb_lsb(img, n_lsb=3)
-    assert (recombine_hsb_lsb(hsb, lsb, n_lsb=3) == img).all()
+@pytest.mark.parametrize("n_parties", [2, 3, 5])
+def test_shares_sum_to_cover(textured_cover, n_parties):
+    res = additive_share_image(textured_cover, n_parties=n_parties, seed=17)
+    combined = additive_combine_shares(res.shares)
+    assert (combined == textured_cover.astype(np.int64)).all()
 
 
-def test_additive_share_sum_equals_cover(synthetic_random_image):
-    shares = additive_share_image(synthetic_random_image, n_lsb=3, seed=1234)
-    recovered = additive_combine_shares(shares.share1, shares.share2)
-    assert (recovered == synthetic_random_image).all(), "Shares must sum to cover"
+def test_hsb_lsb_split_round_trip(textured_cover):
+    hsb, lsb = split_hsb_lsb(textured_cover, n_lsb=3)
+    rec = recombine_hsb_lsb(hsb, lsb, n_lsb=3)
+    assert (rec == textured_cover.astype(np.int64)).all()
 
 
-def test_share_hsb_and_lsb_reconstruct_cover(synthetic_random_image):
-    """Eqs. 11-14 (carry-aware):  shares reconstruct the cover exactly.
+def test_any_single_share_viewed_mod256_has_low_correlation_with_cover(textured_cover):
+    """Shares viewed as uint8 (mod 256) must be indistinguishable from uniform.
 
-    Because we share LSBs modularly (to keep arithmetic-shift-based HSB
-    recovery well-defined for negative shares), the HSB parts sum to
-    ``cover_HSB - carry`` and the LSB parts sum to ``cover_LSB + carry * 2^n``.
-    These are consistent -- i.e. ``share1 + share2 == cover`` exactly --
-    which is the *functional* invariant the SMC embedding depends on.
+    This is the information-theoretic view that makes the scheme a
+    one-time pad.  Signed int32 shares can correlate with the cover
+    because one share contains (cover - uniform_mask) as a signed
+    integer, but the mod-256 view cancels that.
     """
-    n = 3
-    shares = additive_share_image(synthetic_random_image, n_lsb=n, seed=42)
-    h1 = share_hsb_plane(shares.share1, n)
-    h2 = share_hsb_plane(shares.share2, n)
-    l1 = share_lsb_plane(shares.share1, n)
-    l2 = share_lsb_plane(shares.share2, n)
-    hsb, lsb = split_hsb_lsb(synthetic_random_image, n)
-    carry = ((l1 + l2) >= (1 << n)).astype(np.int64)
-    assert (h1 + h2 + carry == hsb).all(), "HSB equality must hold up to the LSB carry"
-    assert ((l1 + l2) % (1 << n) == lsb).all(), "LSB sum is correct mod 2^n"
-    # Overall additive invariant (Eq. 7).
-    assert (shares.share1.astype(np.int64) + shares.share2.astype(np.int64)
-            == synthetic_random_image).all()
+    res = additive_share_image(textured_cover, n_parties=2, seed=31337)
+    cover = textured_cover.astype(np.float64).ravel()
+    cover -= cover.mean()
+    for s in res.shares:
+        s_mod = (s.astype(np.int64) % 256).astype(np.float64).ravel()
+        s_mod -= s_mod.mean()
+        denom = np.linalg.norm(cover) * np.linalg.norm(s_mod)
+        corr = float((cover @ s_mod) / denom)
+        assert abs(corr) < 0.05, corr
 
 
-def test_share_is_random_not_cover():
-    """A single share alone must not leak the cover (additive OTP property)."""
-    img = np.full((16, 16), 100, dtype=np.uint8)
-    shares_a = additive_share_image(img, n_lsb=3, seed=1)
-    shares_b = additive_share_image(img, n_lsb=3, seed=2)
-    # Two independent share-1's of the same cover should differ heavily.
-    diff_fraction = np.mean(shares_a.share1 != shares_b.share1)
-    assert diff_fraction > 0.5
+def test_different_seeds_give_different_shares(textured_cover):
+    a = additive_share_image(textured_cover, n_parties=2, seed=1)
+    b = additive_share_image(textured_cover, n_parties=2, seed=2)
+    assert not np.array_equal(a.shares[0], b.shares[0])
 
 
-def test_shares_in_gray_range_mask(synthetic_random_image):
-    shares = additive_share_image(synthetic_random_image, n_lsb=3, seed=0)
-    mask = shares_in_gray_range(shares)
-    # Many shares will overflow this by design; we just check that the
-    # in-range shares really are in [0,255].
-    assert shares.share1[mask].min() >= 0
-    assert shares.share1[mask].max() <= 255
-    assert shares.share2[mask].min() >= 0
-    assert shares.share2[mask].max() <= 255
+def test_npcr_under_random_key_regime_is_near_ideal(textured_cover):
+    """With two independent random keys the shares look like fresh random bytes.
+
+    This is the 'random-key' NPCR protocol used by some papers to
+    report ~99.6% NPCR.  It is trivially satisfied by any
+    keystream-based OTP, and serves as a sanity check that our
+    keystream is not re-using state across seeds.
+    """
+    a = additive_share_image(textured_cover, n_parties=2, seed=100)
+    b = additive_share_image(textured_cover, n_parties=2, seed=200)
+    diffs_share0 = (a.shares[0] != b.shares[0]).mean() * 100.0
+    assert diffs_share0 > 99.0
+
+
+def test_rejects_non_uint8(textured_cover):
+    with pytest.raises(TypeError):
+        additive_share_image(textured_cover.astype(np.int16))

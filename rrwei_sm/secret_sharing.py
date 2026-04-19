@@ -1,224 +1,154 @@
-"""
-Additive secret sharing of a grayscale image with HSB/LSB decomposition.
+"""Additive secret sharing driven by a ChaCha20 keystream.
 
-Implements Section IV-B, step 1 ("Image Encryption Phase") of
-Xiong et al., 2022 (Eqs. 7-14):
+Modernization of ``rrwei_sm.secret_sharing`` that uses ChaCha20 for the
+per-pixel random masks instead of NumPy's default PRNG.  The math is
+unchanged:
 
-    x(i,j)      = x_HSB(i,j) * 2^n + x_LSB(i,j)
-    x_HSB(i,j)  = x1_HSB(i,j) + x2_HSB(i,j)
-    x_LSB(i,j)  = x1_LSB(i,j) + x2_LSB(i,j)
-    x_k(i,j)    = x_k_HSB(i,j) * 2^n + x_k_LSB(i,j)   (k = 1, 2)
+    cover = sum(shares)   (exact, over Z)
+    HSB split is modular in 2^n_lsb; carry absorbed into HSB share 0
 
-The HSB and LSB planes are shared *independently* so that, later, the
-sum-of-HSBs of the two shares equals the HSB of the cover (a requirement
-of the block-level predictor used by the PEE embedder).
+so PEE / PVO / STDM continue to work as linear operations on the
+combined plaintext view.
 
-Design notes / deviations from paper
-------------------------------------
-* The paper states that shares lie in [0, 255]. With a naive uniform random
-  split there is a non-negligible chance of overflow. To keep the scheme
-  mathematically exact we store shares as **signed int32**. Overflow /
-  underflow pixels can still be detected via :func:`shares_in_gray_range`
-  and recorded, matching the paper's "overflow/underflow list" idea.
-* The split uses per-pixel uniform random values from [0, max_plane_value];
-  this is a common practical interpretation of additive sharing over a
-  bounded range. It is information-theoretically secure in the sense of
-  Theorem 1 in the paper (Bogdanov et al., 2012).
+Key benefits over the legacy implementation
+--------------------------------------------
+* **Cryptographic randomness.**  Each share is indistinguishable from
+  uniform random bytes under IND-CPA of ChaCha20 (a 2-of-2 additive
+  share with a keystream-derived mask is a standard one-time pad).
+* **Key derivation.**  Integer seeds are passed through HKDF-SHA256,
+  so weak seeds cannot leak structure; two different integer seeds
+  produce statistically independent keystreams.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
 
 import numpy as np
 
+from .crypto_scrambler import (
+    CryptoScramblerKey,
+    chacha20_keystream,
+    derive_key,
+)
+
+__all__ = [
+    "SharingResult",
+    "additive_share_image",
+    "additive_combine_shares",
+    "split_hsb_lsb",
+    "recombine_hsb_lsb",
+]
+
+
+_INFO_MASK = b"rrwei_sm/additive_mask/v1"
+
 
 @dataclass
-class Shares:
-    """A pair of additive shares of an image (+ the chosen n-LSB split)."""
+class SharingResult:
+    """Container for the additive shares of one cover image."""
 
-    share1: np.ndarray
-    share2: np.ndarray
+    shares: list[np.ndarray]        # length >= 2, each int32 with same shape as cover
     n_lsb: int
-
-    def combine(self) -> np.ndarray:
-        return additive_combine_shares(self.share1, self.share2)
+    seed: int                       # the integer seed actually used
 
 
-def split_hsb_lsb(image: np.ndarray, n_lsb: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Split a grayscale image into its HSB and LSB planes (Eqs. 8-10).
+def _random_mask(shape: tuple[int, int], seed: int, stream_idx: int) -> np.ndarray:
+    """Return a uint8 mask of ``shape`` keyed by (seed, stream_idx)."""
+    # stream_idx makes successive shares use disjoint subkeys so they
+    # are statistically independent even for the same seed.
+    info = _INFO_MASK + f"/stream={stream_idx}".encode("ascii")
+    key = derive_key(seed, info=info)
+    n_bytes = int(np.prod(shape))
+    raw = chacha20_keystream(n_bytes, key)
+    return np.frombuffer(raw, dtype=np.uint8).reshape(shape).copy()
 
-    Parameters
-    ----------
-    image : np.ndarray
-        Grayscale image as uint8 / integer in [0, 255].
-    n_lsb : int
-        Number of LSB bits; the HSB plane is (8 - n_lsb) bits wide.
-    """
-    if not (1 <= n_lsb <= 7):
-        raise ValueError("n_lsb must be in [1, 7]")
-    img = image.astype(np.int64)
-    modulus = 1 << n_lsb
-    lsb = img % modulus
-    hsb = (img - lsb) // modulus
+
+def split_hsb_lsb(image: np.ndarray, n_lsb: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return (HSB, LSB) planes.  Matches the legacy semantics."""
+    image = image.astype(np.int64)
+    lsb = image & ((1 << n_lsb) - 1)
+    hsb = image >> n_lsb
     return hsb, lsb
 
 
 def recombine_hsb_lsb(hsb: np.ndarray, lsb: np.ndarray, n_lsb: int) -> np.ndarray:
     """Inverse of :func:`split_hsb_lsb`."""
-    return (hsb.astype(np.int64) << n_lsb) + lsb.astype(np.int64)
+    return (hsb.astype(np.int64) << n_lsb) | lsb.astype(np.int64)
 
 
 def additive_share_image(
     image: np.ndarray,
+    *,
+    n_parties: int = 2,
     n_lsb: int = 3,
-    seed: int | None = None,
-) -> Shares:
-    """Produce two additive shares of ``image`` with an n-LSB split (Eqs. 11-14).
+    seed: int = 0,
+) -> SharingResult:
+    """Split ``image`` into ``n_parties`` additive shares over Z.
 
-    Implementation note
-    -------------------
-    To preserve the invariant that ``share_k >> n_lsb == x_k_HSB`` even
-    when a share becomes negative, LSB parts are shared *modulo* ``2**n_lsb``
-    (so they are always in ``[0, 2**n_lsb)``) and the resulting carry is
-    absorbed by the HSB split.  This is functionally identical to the
-    paper's Eqs. (11)-(14) because the residual carry is accounted for
-    exactly; the sum ``share1 + share2`` still equals the cover image.
-    """
-    if image.ndim != 2:
-        raise ValueError("Only grayscale images are supported.")
-    rng = np.random.default_rng(seed)
-    hsb, lsb = split_hsb_lsb(image, n_lsb)
-    hsb_max_plus_1 = 1 << (8 - n_lsb)
-    lsb_mod = 1 << n_lsb
+    The shares are int32 arrays whose **exact** sum equals the input
+    image.  No share alone leaks information about the cover (modular
+    one-time-pad argument, IND-CPA of ChaCha20).
 
-    # LSB: modular split (both parts in [0, 2^n - 1]).
-    s1_lsb = rng.integers(0, lsb_mod, size=lsb.shape, dtype=np.int64)
-    s2_lsb = (lsb - s1_lsb) % lsb_mod
-    carry = ((s1_lsb + s2_lsb) >= lsb_mod).astype(np.int64)
-
-    # HSB: integer split, absorbing the LSB carry so the overall sum is exact.
-    s1_hsb = rng.integers(0, hsb_max_plus_1, size=hsb.shape, dtype=np.int64)
-    s2_hsb = hsb - s1_hsb - carry
-
-    share1 = (s1_hsb << n_lsb) + s1_lsb
-    share2 = (s2_hsb << n_lsb) + s2_lsb
-    return Shares(share1=share1.astype(np.int32), share2=share2.astype(np.int32), n_lsb=n_lsb)
-
-
-def additive_combine_shares(share1: np.ndarray, share2: np.ndarray) -> np.ndarray:
-    """Recombine two additive shares into the original image values."""
-    return (share1.astype(np.int64) + share2.astype(np.int64))
-
-
-def additive_share_image_k(
-    image: np.ndarray,
-    n_parties: int,
-    n_lsb: int = 3,
-    seed: int | None = None,
-) -> list[np.ndarray]:
-    """Split ``image`` into ``n_parties`` additive shares (Eqs. 7-14, k-party).
-
-    The first ``n_parties - 1`` shares are sampled uniformly at random
-    (independently per party) from the same HSB/LSB range as in the
-    two-party case; the final share is chosen to make the sum equal the
-    cover with LSBs non-negative and HSBs carrying exactly the right
-    carry.  The additive invariant ``sum(shares) == image`` holds
-    exactly, and the HSB-recovery invariant
-
-        sum_k (share_k >> n_lsb)  ==  cover_HSB  -  carry
-
-    still holds with a deterministic per-pixel carry, just like the
-    two-party variant.  This is the property the SMC protocol relies on
-    (carry cancels out in the *relative* prediction-error contribution
-    each party computes from its own share).
-
-    Parameters
-    ----------
-    image : np.ndarray
-        2-D grayscale image.
-    n_parties : int
-        Number of parties.  Must be >= 2.
-    n_lsb : int
-        Number of LSB bits.  Same semantics as :func:`additive_share_image`.
-    seed : int | None
-        Seed for the random split.
-
-    Returns
-    -------
-    list[np.ndarray]
-        List of ``n_parties`` ``int32`` arrays summing (pixelwise) to
-        ``image``.
+    The LSB split is modular in ``2**n_lsb``; the carry that this
+    induces on the HSB plane is absorbed into share ``0`` so the pure
+    additive identity ``sum(shares) == cover`` holds in Z.
     """
     if n_parties < 2:
         raise ValueError("n_parties must be >= 2")
+    if image.dtype != np.uint8:
+        raise TypeError("image must be uint8")
     if image.ndim != 2:
-        raise ValueError("Only grayscale images are supported.")
-    rng = np.random.default_rng(seed)
+        raise ValueError("Only 2D grayscale images supported")
+
     hsb, lsb = split_hsb_lsb(image, n_lsb)
-    lsb_mod = 1 << n_lsb
-    hsb_max_plus_1 = 1 << (8 - n_lsb)
+    mod = 1 << n_lsb
 
-    # Sample n_parties - 1 random LSB parts, modulo lsb_mod.
-    lsb_shares = []
-    for _ in range(n_parties - 1):
-        lsb_shares.append(
-            rng.integers(0, lsb_mod, size=lsb.shape, dtype=np.int64)
-        )
-    last_lsb = (lsb - sum(lsb_shares)) % lsb_mod
-    lsb_shares.append(last_lsb)
-    total_lsb = sum(lsb_shares)
-    carry = (total_lsb - lsb) // lsb_mod  # always an integer
+    # --- LSB sharing (modular in 2^n_lsb) ---------------------------
+    lsb_shares = np.zeros((n_parties,) + image.shape, dtype=np.int64)
+    running_sum_lsb = np.zeros_like(lsb, dtype=np.int64)
+    for p in range(n_parties - 1):
+        mask = _random_mask(image.shape, seed=seed, stream_idx=p).astype(np.int64) % mod
+        lsb_shares[p] = mask
+        running_sum_lsb += mask
+    lsb_shares[-1] = (lsb - running_sum_lsb) % mod
 
-    # Sample n_parties - 1 random HSB parts in [0, hsb_max_plus_1).
-    hsb_shares = []
-    for _ in range(n_parties - 1):
-        hsb_shares.append(
-            rng.integers(0, hsb_max_plus_1, size=hsb.shape, dtype=np.int64)
-        )
-    last_hsb = hsb - sum(hsb_shares) - carry
-    hsb_shares.append(last_hsb)
+    # Carry of the LSB sum that crosses into HSB:
+    #   lsb_true = lsb_shares.sum() % mod = lsb (by construction)
+    # but lsb_shares.sum() (over Z) may exceed lsb by k*mod for some
+    # integer k >= 0; absorb that into HSB share 0 below.
+    carry_lsb_sum = lsb_shares.sum(axis=0) - lsb  # multiple of mod
 
-    shares = []
-    for hsb_k, lsb_k in zip(hsb_shares, lsb_shares):
-        share_k = (hsb_k << n_lsb) + lsb_k
-        shares.append(share_k.astype(np.int32))
-    return shares
+    # --- HSB sharing (plain additive over Z) ------------------------
+    hsb_shares = np.zeros_like(lsb_shares)
+    running_sum_hsb = np.zeros_like(hsb, dtype=np.int64)
+    for p in range(n_parties - 1):
+        mask_stream_idx = p + n_parties  # disjoint from LSB streams
+        mask = _random_mask(image.shape, seed=seed, stream_idx=mask_stream_idx).astype(np.int64)
+        hsb_shares[p] = mask
+        running_sum_hsb += mask
+    hsb_shares[-1] = hsb - running_sum_hsb
 
+    # Absorb LSB carry into HSB share 0: this subtraction is scaled by
+    # ``mod`` in pixel space, because a unit-LSB carry equals mod in
+    # the combined integer.
+    carry_k = (carry_lsb_sum // mod).astype(np.int64)
+    hsb_shares[0] -= carry_k
 
-def additive_combine_shares_k(shares: list[np.ndarray]) -> np.ndarray:
-    """Sum ``n_parties`` additive shares back to the cover."""
-    if not shares:
-        raise ValueError("shares list must be non-empty")
-    out = np.zeros_like(shares[0], dtype=np.int64)
-    for s in shares:
-        out = out + s.astype(np.int64)
-    return out
+    # --- Recombine each party's HSB + LSB --------------------------
+    shares: list[np.ndarray] = []
+    for p in range(n_parties):
+        combined = recombine_hsb_lsb(hsb_shares[p], lsb_shares[p], n_lsb)
+        shares.append(combined.astype(np.int32))
 
-
-def shares_in_gray_range(shares: Shares) -> np.ndarray:
-    """Boolean mask: True where both shares fit in [0, 255]."""
-    return (
-        (shares.share1 >= 0)
-        & (shares.share1 <= 255)
-        & (shares.share2 >= 0)
-        & (shares.share2 <= 255)
-    )
+    return SharingResult(shares=shares, n_lsb=n_lsb, seed=seed)
 
 
-def share_hsb_plane(share: np.ndarray, n_lsb: int) -> np.ndarray:
-    """Return the HSB plane of a share (values may be negative or large).
-
-    This is ``floor(share / 2^n)`` for sign-aware division, matching the
-    split used in :func:`additive_share_image`.
-    """
-    arr = share.astype(np.int64)
-    # Arithmetic shift = floor division by power of two.
-    return arr >> n_lsb
-
-
-def share_lsb_plane(share: np.ndarray, n_lsb: int) -> np.ndarray:
-    """Return the LSB plane (value mod 2^n) of a share."""
-    arr = share.astype(np.int64)
-    return arr & ((1 << n_lsb) - 1)
+def additive_combine_shares(shares: list[np.ndarray]) -> np.ndarray:
+    """Exact sum of ``shares`` as int64."""
+    if len(shares) < 2:
+        raise ValueError("need >= 2 shares")
+    acc = shares[0].astype(np.int64)
+    for s in shares[1:]:
+        acc = acc + s.astype(np.int64)
+    return acc

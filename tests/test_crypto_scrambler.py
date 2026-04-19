@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from rrwei_sm_modern.crypto_scrambler import (
+from rrwei_sm.crypto_scrambler import (
     CryptoScramblerKey,
     block_scramble,
     block_unscramble,
