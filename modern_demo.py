@@ -58,6 +58,40 @@ def _step1_encryption_roundtrip() -> None:
         print(f"  {name:12s} shape={cover.shape} round-trip OK; n_parties={len(res.shares)}")
 
 
+def _step2_stdm_robustness() -> None:
+    """Step 2 gate: STDM embeds 256 bits, JPEG q=40 BER <= 0.1 on lena_like."""
+    import io
+
+    from PIL import Image
+
+    from datasets import lena_like
+    from rrwei_sm_modern.stdm import STDMConfig, embed, extract
+
+    print("\n== Step 2: STDM robust watermark (128x128, 256 bits) ==")
+    cover = lena_like(size=128)
+    bits = np.random.default_rng(42).integers(0, 2, size=256, dtype=np.uint8)
+    cfg = STDMConfig(delta=40.0, n_coeffs=4, seed=7)
+    marked, side = embed(cover, bits, cfg)
+    mse = np.mean((marked.astype(np.float64) - cover.astype(np.float64)) ** 2)
+    psnr = 10.0 * np.log10(255.0**2 / max(mse, 1e-8))
+
+    buf = io.BytesIO()
+    Image.fromarray(marked).save(buf, format="JPEG", quality=40)
+    buf.seek(0)
+    attacked = np.array(Image.open(buf).convert("L"), dtype=np.uint8)
+
+    out_clean = extract(marked, side)
+    out_jpeg = extract(attacked, side)
+    ber_clean = float((out_clean != bits).mean())
+    ber_jpeg = float((out_jpeg != bits).mean())
+    print(
+        f"  lena_like 128x128: PSNR={psnr:.2f} dB, "
+        f"BER(clean)={ber_clean:.3f}, BER(JPEG q=40)={ber_jpeg:.3f}"
+    )
+    assert ber_clean == 0.0
+    assert ber_jpeg <= 0.10, ber_jpeg
+
+
 def main() -> int:
     import rrwei_sm_modern  # noqa: F401
 
@@ -73,6 +107,9 @@ def main() -> int:
         "rrwei_sm_modern.secret_sharing",
     }.issubset(imported):
         _step1_encryption_roundtrip()
+
+    if "rrwei_sm_modern.stdm" in imported:
+        _step2_stdm_robustness()
 
     return 0
 

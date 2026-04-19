@@ -67,7 +67,7 @@ Encrypt = `scramble` → `additive_share`.
 `rrwei_sm/hua_scrambling.py` (`scrambler="hua"`, 2D Logistic-Sine
 Coupling Map, Hua et al. 2018).
 
-![Block-level scrambling illustration](assets/Block-level-scrambling-1.png)
+![Block-level scrambling illustration](assets/block-level-scrambling-1.png)
 
 - The image is reshaped to `(H/2, W/2, 2, 2)`, giving `H*W/4` blocks.
 - A pseudo-random permutation of block indices is generated from
