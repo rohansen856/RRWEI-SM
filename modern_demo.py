@@ -114,7 +114,37 @@ def main() -> int:
     if "rrwei_sm_modern.coding" in imported:
         _step3_rans_roundtrip()
 
+    if "rrwei_sm_modern.threshold_sharing" in imported:
+        _step4_threshold_sharing()
+
     return 0
+
+
+def _step4_threshold_sharing() -> None:
+    """Step 4 gate: (2, 3) RSS round-trip + privacy invariant."""
+    from datasets import load_classic_images
+    from rrwei_sm_modern.threshold_sharing import (
+        apply_owner_delta,
+        combine,
+        share,
+    )
+
+    covers = load_classic_images(size=64)
+    print("\n== Step 4: (k, n) replicated secret sharing ==")
+    for name, cover in covers.items():
+        shares = share(cover, k=2, n=3, seed=0xdeadfeed)
+        recovered = combine(shares, [0, 1]).astype(np.uint8)
+        assert (recovered == cover).all()
+
+        delta = np.zeros(cover.shape, dtype=np.int64)
+        delta[5, 5] = 8
+        marked = apply_owner_delta(shares, owner_idx=0, delta=delta)
+        marked_img = combine(marked, [1, 2]).astype(np.int64)
+        assert (marked_img - cover.astype(np.int64) == delta).all()
+        print(
+            f"  {name:12s} (k=2, n=3) round-trip OK; "
+            f"owner-delta propagates via any 2 of 3 parties."
+        )
 
 
 def _step3_rans_roundtrip() -> None:
