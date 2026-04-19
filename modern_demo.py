@@ -117,7 +117,51 @@ def main() -> int:
     if "rrwei_sm_modern.threshold_sharing" in imported:
         _step4_threshold_sharing()
 
+    if "rrwei_sm_modern.pvo" in imported:
+        _step5_pvo_capacity()
+
     return 0
+
+
+def _step5_pvo_capacity() -> None:
+    """Step 5 gate: PVO reversible round-trip on all three covers."""
+    from datasets import load_classic_images
+    from rrwei_sm_modern.pvo import capacity_estimate, embed, extract
+
+    covers = load_classic_images(size=128)
+    print("\n== Step 5: PVO + pairwise PEE reversible predictor ==")
+    for name, cover in covers.items():
+        rng = np.random.default_rng(11)
+        current = cover.copy()
+        sides = []
+        bit_trail = []
+        n_layers = 0
+        total = 0
+        for _ in range(4):
+            cap = capacity_estimate(current)
+            n_bits = cap["max_side"] + cap["min_side"]
+            if n_bits == 0:
+                break
+            bits = rng.integers(0, 2, size=n_bits, dtype=np.uint8)
+            current, side, n_emb = embed(current, bits)
+            sides.append(side)
+            bit_trail.append(bits[:n_emb])
+            total += n_emb
+            n_layers += 1
+        marked = current.copy()
+        mse = np.mean((marked.astype(np.float64) - cover.astype(np.float64)) ** 2)
+        psnr = 99.0 if mse == 0 else 10.0 * np.log10(255.0**2 / mse)
+
+        # Reverse traversal.
+        for side, bits in zip(reversed(sides), reversed(bit_trail)):
+            current, out_bits = extract(current, side)
+            assert (out_bits == bits).all(), name
+        assert (current == cover).all(), name
+
+        print(
+            f"  {name:12s} layers={n_layers} bpp={total/cover.size:.3f} "
+            f"PSNR(marked)={psnr:.2f} dB; reversible round-trip OK"
+        )
 
 
 def _step4_threshold_sharing() -> None:
