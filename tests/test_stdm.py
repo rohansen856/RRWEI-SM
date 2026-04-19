@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from rrwei_sm_modern.stdm import STDMConfig, embed, extract
+from rrwei_sm.stdm import STDMConfig, embed, extract
 
 
 def _rng_bits(n: int, seed: int = 0) -> np.ndarray:

@@ -85,7 +85,7 @@ _MID_FREQ_COORDS: tuple[tuple[int, int], ...] = (
     (5, 1), (5, 2), (5, 3), (5, 4),
 )
 
-_INFO_SPREAD = b"rrwei_sm_modern/stdm/spreading_vector/v1"
+_INFO_SPREAD = b"rrwei_sm/stdm/spreading_vector/v1"
 
 
 @dataclass(frozen=True)
