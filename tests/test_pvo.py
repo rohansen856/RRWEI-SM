@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from rrwei_sm_modern.pvo import (
+from rrwei_sm.pvo import (
     capacity_estimate,
     embed,
     extract,

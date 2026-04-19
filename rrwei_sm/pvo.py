@@ -47,7 +47,7 @@ Side information (per side, per layer)
   contributed neither a bit nor a shift.
 * ``n_embedded`` : int -- how many bits the side carried.
 
-These go through the rANS coder (:mod:`rrwei_sm_modern.coding`) in the
+These go through the rANS coder (:mod:`rrwei_sm.coding`) in the
 orchestrator stage, not here.
 """
 
@@ -55,6 +55,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numba
 import numpy as np
 
 __all__ = [
@@ -66,6 +67,182 @@ __all__ = [
 
 
 _BLOCK = 2  # 2x2 blocks
+
+
+# ---------------------------------------------------------------------------
+# Numba-accelerated hot loops.
+# ---------------------------------------------------------------------------
+
+@numba.njit(cache=True)
+def _pvo_embed_inner(
+    blocks: np.ndarray,      # shape (n_blocks, 4) int64
+    bits: np.ndarray,        # shape (B,) int8 (0/1) or uint8
+    n_bits: int,
+    do_max: bool,            # True -> max-side pass, False -> min-side pass
+) -> tuple:
+    """JIT-compiled PVO inner loop for one pass (max or min).
+
+    Updates ``blocks`` in-place and returns (n_embedded, skipped_mask).
+    """
+    n_blocks = blocks.shape[0]
+    skipped = np.ones(n_blocks, dtype=np.bool_)
+    bit_idx = 0
+    n_embedded = 0
+
+    for i in range(n_blocks):
+        # 4-way insertion sort over the block's pixel values to find max / min.
+        a = blocks[i, 0]
+        b = blocks[i, 1]
+        c = blocks[i, 2]
+        d = blocks[i, 3]
+        # Find argmax / argmin with ties broken by position.
+        argmax = 0
+        max_val = a
+        if b > max_val:
+            max_val = b
+            argmax = 1
+        if c > max_val:
+            max_val = c
+            argmax = 2
+        if d > max_val:
+            max_val = d
+            argmax = 3
+        argmin = 0
+        min_val = a
+        if b < min_val:
+            min_val = b
+            argmin = 1
+        if c < min_val:
+            min_val = c
+            argmin = 2
+        if d < min_val:
+            min_val = d
+            argmin = 3
+
+        if do_max:
+            # Find second-max (excluding argmax position).
+            second = -10**9
+            for j in range(4):
+                if j != argmax and blocks[i, j] > second:
+                    second = blocks[i, j]
+            u = blocks[i, argmax] - second
+            if u == 0 or blocks[i, argmax] >= 255:
+                continue
+            if bit_idx >= n_bits:
+                continue
+            if u == 1:
+                bit = bits[bit_idx]
+                new_val = blocks[i, argmax] + bit
+                if new_val > 255:
+                    continue
+                blocks[i, argmax] = new_val
+                bit_idx += 1
+                n_embedded += 1
+                skipped[i] = False
+            else:
+                new_val = blocks[i, argmax] + 1
+                if new_val > 255:
+                    continue
+                blocks[i, argmax] = new_val
+                skipped[i] = False
+        else:
+            # Find second-min (excluding argmin position).
+            second = 10**9
+            for j in range(4):
+                if j != argmin and blocks[i, j] < second:
+                    second = blocks[i, j]
+            v = second - blocks[i, argmin]
+            if v == 0 or blocks[i, argmin] <= 0:
+                continue
+            if bit_idx >= n_bits:
+                continue
+            if v == 1:
+                bit = bits[bit_idx]
+                new_val = blocks[i, argmin] - bit
+                if new_val < 0:
+                    continue
+                blocks[i, argmin] = new_val
+                bit_idx += 1
+                n_embedded += 1
+                skipped[i] = False
+            else:
+                new_val = blocks[i, argmin] - 1
+                if new_val < 0:
+                    continue
+                blocks[i, argmin] = new_val
+                skipped[i] = False
+
+    return n_embedded, skipped
+
+
+@numba.njit(cache=True)
+def _pvo_extract_inner(
+    blocks: np.ndarray,       # shape (n_blocks, 4) int64
+    skipped: np.ndarray,      # bool per block
+    do_max: bool,
+) -> np.ndarray:
+    """JIT-compiled inverse of one PVO pass.  Updates ``blocks`` in place.
+
+    Returns an int64 array of extracted bits, in ascending block order.
+    """
+    n_blocks = blocks.shape[0]
+    out = np.empty(n_blocks, dtype=np.int64)
+    n_out = 0
+
+    # Traverse in reverse (mirror of embed pass) to match the forward
+    # order of the embedded bits.
+    for ii in range(n_blocks - 1, -1, -1):
+        i = ii
+        if skipped[i]:
+            continue
+        argmax = 0
+        max_val = blocks[i, 0]
+        for j in range(1, 4):
+            if blocks[i, j] > max_val:
+                max_val = blocks[i, j]
+                argmax = j
+        argmin = 0
+        min_val = blocks[i, 0]
+        for j in range(1, 4):
+            if blocks[i, j] < min_val:
+                min_val = blocks[i, j]
+                argmin = j
+        if do_max:
+            second = -10**9
+            for j in range(4):
+                if j != argmax and blocks[i, j] > second:
+                    second = blocks[i, j]
+            u = blocks[i, argmax] - second
+            if u == 1:
+                out[n_out] = 0
+                n_out += 1
+            elif u == 2:
+                blocks[i, argmax] -= 1
+                out[n_out] = 1
+                n_out += 1
+            else:
+                blocks[i, argmax] -= 1
+        else:
+            second = 10**9
+            for j in range(4):
+                if j != argmin and blocks[i, j] < second:
+                    second = blocks[i, j]
+            v = second - blocks[i, argmin]
+            if v == 1:
+                out[n_out] = 0
+                n_out += 1
+            elif v == 2:
+                blocks[i, argmin] += 1
+                out[n_out] = 1
+                n_out += 1
+            else:
+                blocks[i, argmin] += 1
+
+    # Reverse so that out[0..n_out) is in forward embed order.
+    final = np.empty(n_out, dtype=np.int64)
+    for j in range(n_out):
+        final[j] = out[n_out - 1 - j]
+    return final
 
 
 @dataclass
@@ -218,114 +395,69 @@ def _invert_min_rule(block: np.ndarray) -> tuple[np.ndarray, int | None]:
 def embed(
     image: np.ndarray, bits: np.ndarray
 ) -> tuple[np.ndarray, PVOSideInfo, int]:
-    """Embed ``bits`` (1D uint8 0/1) via pairwise PVO.
+    """Embed ``bits`` via pairwise PVO (Numba-JIT accelerated).
 
     Returns ``(marked_image, side_info, n_embedded)``.
-
-    Bits are consumed greedily -- first all max-side embeddings across
-    the block grid, then all min-side embeddings on the (already
-    max-modified) blocks.  This interleaving is important for
-    reversibility: extraction must invert in reverse order.
     """
     if image.ndim != 2:
         raise ValueError("image must be 2D")
-    if image.dtype != np.uint8:
-        # Allow int-typed covers (e.g. HSB plane after sharing) but
-        # clamp at the end.
-        pass
     if bits.ndim != 1:
         raise ValueError("bits must be 1D")
 
     blocks, grid = _block_view(image.astype(np.int64))
-    n_blocks = blocks.shape[0]
-    skipped_max = np.zeros(n_blocks, dtype=bool)
-    skipped_min = np.zeros(n_blocks, dtype=bool)
-    bit_idx = 0
-    total = int(bits.size)
+    bits_i8 = np.ascontiguousarray(bits.astype(np.int8))
 
-    # Pass 1: max side.
-    n_max_embedded = 0
-    for i in range(n_blocks):
-        bit = int(bits[bit_idx]) if bit_idx < total else None
-        new_block, did_embed, skipped = _apply_max_rule(blocks[i], bit)
-        blocks[i] = new_block
-        skipped_max[i] = skipped
-        if did_embed:
-            n_max_embedded += 1
-            bit_idx += 1
-
-    # Pass 2: min side on the (updated) blocks.
-    n_min_embedded = 0
-    for i in range(n_blocks):
-        bit = int(bits[bit_idx]) if bit_idx < total else None
-        new_block, did_embed, skipped = _apply_min_rule(blocks[i], bit)
-        blocks[i] = new_block
-        skipped_min[i] = skipped
-        if did_embed:
-            n_min_embedded += 1
-            bit_idx += 1
+    # Pass 1: max side consumes bits[0..); the JIT function returns how
+    # many bits it actually embedded.
+    n_max_embedded, skipped_max = _pvo_embed_inner(
+        blocks, bits_i8, bits_i8.size, True,
+    )
+    # Pass 2: min side consumes bits[n_max_embedded..).
+    remaining = bits_i8[n_max_embedded:]
+    n_min_embedded, skipped_min = _pvo_embed_inner(
+        blocks, remaining, remaining.size, False,
+    )
 
     marked = np.clip(_unblock(blocks, grid), 0, 255).astype(np.uint8)
     side = PVOSideInfo(
         shape=image.shape,
-        n_blocks=n_blocks,
-        skipped_max=skipped_max,
-        skipped_min=skipped_min,
-        n_embedded_max=n_max_embedded,
-        n_embedded_min=n_min_embedded,
+        n_blocks=blocks.shape[0],
+        skipped_max=np.asarray(skipped_max, dtype=bool),
+        skipped_min=np.asarray(skipped_min, dtype=bool),
+        n_embedded_max=int(n_max_embedded),
+        n_embedded_min=int(n_min_embedded),
     )
-    return marked, side, n_max_embedded + n_min_embedded
+    return marked, side, int(n_max_embedded + n_min_embedded)
 
 
 def extract(
     marked: np.ndarray, side: PVOSideInfo
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Inverse of :func:`embed`.
-
-    Returns ``(recovered_image, bits)`` where ``bits`` has length
-    ``side.n_embedded_max + side.n_embedded_min`` in the embedding
-    order (all max bits followed by all min bits).
-    """
+    """Inverse of :func:`embed` (Numba-JIT accelerated)."""
     if marked.shape != side.shape:
         raise ValueError(f"shape mismatch: {marked.shape} vs {side.shape}")
     blocks, grid = _block_view(marked.astype(np.int64))
-    n_blocks = blocks.shape[0]
-    assert n_blocks == side.n_blocks, (n_blocks, side.n_blocks)
+    assert blocks.shape[0] == side.n_blocks
 
-    min_bits_reverse: list[int] = []
-    # Invert min side first (reverse order within the pass).
-    for i in range(n_blocks - 1, -1, -1):
-        if side.skipped_min[i]:
-            continue
-        orig, bit = _invert_min_rule(blocks[i])
-        blocks[i] = orig
-        if bit is not None:
-            min_bits_reverse.append(bit)
-    min_bits = list(reversed(min_bits_reverse))
+    # Invert passes in reverse order: min first, then max.
+    min_bits = _pvo_extract_inner(blocks, side.skipped_min, False)
+    max_bits = _pvo_extract_inner(blocks, side.skipped_max, True)
 
-    max_bits_reverse: list[int] = []
-    for i in range(n_blocks - 1, -1, -1):
-        if side.skipped_max[i]:
-            continue
-        orig, bit = _invert_max_rule(blocks[i])
-        blocks[i] = orig
-        if bit is not None:
-            max_bits_reverse.append(bit)
-    max_bits = list(reversed(max_bits_reverse))
-
-    if len(max_bits) != side.n_embedded_max:
+    if min_bits.size != side.n_embedded_min:
         raise RuntimeError(
-            f"max-side bit count mismatch: extracted {len(max_bits)}, "
-            f"expected {side.n_embedded_max}"
-        )
-    if len(min_bits) != side.n_embedded_min:
-        raise RuntimeError(
-            f"min-side bit count mismatch: extracted {len(min_bits)}, "
+            f"min-side bit count mismatch: extracted {min_bits.size}, "
             f"expected {side.n_embedded_min}"
+        )
+    if max_bits.size != side.n_embedded_max:
+        raise RuntimeError(
+            f"max-side bit count mismatch: extracted {max_bits.size}, "
+            f"expected {side.n_embedded_max}"
         )
 
     recovered = np.clip(_unblock(blocks, grid), 0, 255).astype(np.uint8)
-    out_bits = np.array(max_bits + min_bits, dtype=np.uint8)
+    out_bits = np.concatenate(
+        [max_bits.astype(np.uint8), min_bits.astype(np.uint8)]
+    )
     return recovered, out_bits
 
 
