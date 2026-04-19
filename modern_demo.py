@@ -123,7 +123,32 @@ def main() -> int:
     if "rrwei_sm_modern.metrics" in imported:
         _step6_perceptual_metrics()
 
+    if "rrwei_sm_modern.attacks" in imported:
+        _step7_modern_attacks()
+
     return 0
+
+
+def _step7_modern_attacks() -> None:
+    """Step 7 gate: STDM + modern attack suite on lena_like."""
+    from datasets import lena_like
+    from rrwei_sm_modern.attacks import AVAILABLE_ATTACKS
+    from rrwei_sm_modern.stdm import STDMConfig, embed, extract
+
+    print("\n== Step 7: Modern attack suite ==")
+    cover = lena_like(size=128)
+    rng = np.random.default_rng(23)
+    bits = rng.integers(0, 2, size=128, dtype=np.uint8)
+    cfg = STDMConfig(delta=60.0, n_coeffs=4, seed=0)
+    marked, side = embed(cover, bits, cfg)
+    rows = []
+    for name, fn in AVAILABLE_ATTACKS.items():
+        attacked = fn(marked)
+        out = extract(attacked, side)
+        ber = float((out != bits).mean())
+        rows.append((name, ber))
+    for name, ber in rows:
+        print(f"  {name:<20s} BER={ber:.3f}")
 
 
 def _step6_perceptual_metrics() -> None:
