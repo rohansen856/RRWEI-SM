@@ -14,15 +14,15 @@ import numpy as np
 
 
 _OPTIONAL_MODULES = [
-    "rrwei_sm_modern.crypto_scrambler",
-    "rrwei_sm_modern.secret_sharing",
-    "rrwei_sm_modern.stdm",
-    "rrwei_sm_modern.coding",
-    "rrwei_sm_modern.threshold_sharing",
-    "rrwei_sm_modern.pvo",
-    "rrwei_sm_modern.metrics",
-    "rrwei_sm_modern.attacks",
-    "rrwei_sm_modern.orchestrator",
+    "rrwei_sm.crypto_scrambler",
+    "rrwei_sm.secret_sharing",
+    "rrwei_sm.stdm",
+    "rrwei_sm.coding",
+    "rrwei_sm.threshold_sharing",
+    "rrwei_sm.pvo",
+    "rrwei_sm.metrics",
+    "rrwei_sm.attacks",
+    "rrwei_sm.orchestrator",
 ]
 
 
@@ -40,8 +40,8 @@ def _import_matrix() -> list[tuple[str, bool]]:
 def _step1_encryption_roundtrip() -> None:
     """Step 1 gate: ChaCha20 scramble + additive shares, round-trip exact."""
     from datasets import load_classic_images
-    from rrwei_sm_modern.crypto_scrambler import block_scramble, block_unscramble
-    from rrwei_sm_modern.secret_sharing import (
+    from rrwei_sm.crypto_scrambler import block_scramble, block_unscramble
+    from rrwei_sm.secret_sharing import (
         additive_combine_shares,
         additive_share_image,
     )
@@ -65,7 +65,7 @@ def _step2_stdm_robustness() -> None:
     from PIL import Image
 
     from datasets import lena_like
-    from rrwei_sm_modern.stdm import STDMConfig, embed, extract
+    from rrwei_sm.stdm import STDMConfig, embed, extract
 
     print("\n== Step 2: STDM robust watermark (128x128, 256 bits) ==")
     cover = lena_like(size=128)
@@ -93,7 +93,7 @@ def _step2_stdm_robustness() -> None:
 
 
 def main() -> int:
-    import rrwei_sm_modern  # noqa: F401
+    import rrwei_sm  # noqa: F401
 
     matrix = _import_matrix()
     print("modern_demo import matrix:")
@@ -103,27 +103,27 @@ def main() -> int:
     imported = {name for name, ok in matrix if ok}
 
     if {
-        "rrwei_sm_modern.crypto_scrambler",
-        "rrwei_sm_modern.secret_sharing",
+        "rrwei_sm.crypto_scrambler",
+        "rrwei_sm.secret_sharing",
     }.issubset(imported):
         _step1_encryption_roundtrip()
 
-    if "rrwei_sm_modern.stdm" in imported:
+    if "rrwei_sm.stdm" in imported:
         _step2_stdm_robustness()
 
-    if "rrwei_sm_modern.coding" in imported:
+    if "rrwei_sm.coding" in imported:
         _step3_rans_roundtrip()
 
-    if "rrwei_sm_modern.threshold_sharing" in imported:
+    if "rrwei_sm.threshold_sharing" in imported:
         _step4_threshold_sharing()
 
-    if "rrwei_sm_modern.pvo" in imported:
+    if "rrwei_sm.pvo" in imported:
         _step5_pvo_capacity()
 
-    if "rrwei_sm_modern.metrics" in imported:
+    if "rrwei_sm.metrics" in imported:
         _step6_perceptual_metrics()
 
-    if "rrwei_sm_modern.attacks" in imported:
+    if "rrwei_sm.attacks" in imported:
         _step7_modern_attacks()
 
     return 0
@@ -132,8 +132,8 @@ def main() -> int:
 def _step7_modern_attacks() -> None:
     """Step 7 gate: STDM + modern attack suite on lena_like."""
     from datasets import lena_like
-    from rrwei_sm_modern.attacks import AVAILABLE_ATTACKS
-    from rrwei_sm_modern.stdm import STDMConfig, embed, extract
+    from rrwei_sm.attacks import AVAILABLE_ATTACKS
+    from rrwei_sm.stdm import STDMConfig, embed, extract
 
     print("\n== Step 7: Modern attack suite ==")
     cover = lena_like(size=128)
@@ -154,8 +154,8 @@ def _step7_modern_attacks() -> None:
 def _step6_perceptual_metrics() -> None:
     """Step 6 gate: LPIPS + DISTS proxy on marked images."""
     from datasets import load_classic_images
-    from rrwei_sm_modern.metrics import dists_proxy, lpips_distance, psnr, ssim
-    from rrwei_sm_modern.stdm import STDMConfig, embed as stdm_embed
+    from rrwei_sm.metrics import dists_proxy, lpips_distance, psnr, ssim
+    from rrwei_sm.stdm import STDMConfig, embed as stdm_embed
 
     print("\n== Step 6: Perceptual metrics (LPIPS + DISTS-proxy) ==")
     covers = load_classic_images(size=128)
@@ -177,7 +177,7 @@ def _step6_perceptual_metrics() -> None:
 def _step5_pvo_capacity() -> None:
     """Step 5 gate: PVO reversible round-trip on all three covers."""
     from datasets import load_classic_images
-    from rrwei_sm_modern.pvo import capacity_estimate, embed, extract
+    from rrwei_sm.pvo import capacity_estimate, embed, extract
 
     covers = load_classic_images(size=128)
     print("\n== Step 5: PVO + pairwise PEE reversible predictor ==")
@@ -218,7 +218,7 @@ def _step5_pvo_capacity() -> None:
 def _step4_threshold_sharing() -> None:
     """Step 4 gate: (2, 3) RSS round-trip + privacy invariant."""
     from datasets import load_classic_images
-    from rrwei_sm_modern.threshold_sharing import (
+    from rrwei_sm.threshold_sharing import (
         apply_owner_delta,
         combine,
         share,
@@ -246,7 +246,7 @@ def _step3_rans_roundtrip() -> None:
     """Step 3 gate: rANS round-trip + compression ratio demo."""
     import zlib
 
-    from rrwei_sm_modern.coding import decode_symbols, encode_symbols, estimate_pmf
+    from rrwei_sm.coding import decode_symbols, encode_symbols, estimate_pmf
 
     rng = np.random.default_rng(0)
     n = 4096

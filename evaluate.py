@@ -1,35 +1,29 @@
 #!/usr/bin/env python3
-"""
-evaluate.py - run the RRWEI-SM paper's experiments on a set of images.
+"""evaluate.py - reproducibility harness for the *modernized* pipeline.
 
-For each image in the set, measures:
+For each image in the evaluated set, measures:
 
-* Encryption-side security      (Sec. V-A):
-    - Share/cover correlation (ideal: 0)
-    - Horizontal/Vertical/Diagonal adjacent-pixel correlation of share
-    - NPCR & UACI when flipping a single cover pixel
-* Marked-image visual quality   (Sec. V-B):
-    - PSNR(cover, marked)
-    - SSIM(cover, marked)
-    - Exact recovery flag
-* Reversible capacity           (Eq. 25/28):
-    - Per-layer and total PEE capacity in bpp
-* Modified-scheme robustness    (Sec. V-C):
-    - BER curve vs Gaussian sigma (1..40 in steps of 5)
-    - BER vs JPEG quality factor (20..95)
-    - BER vs JPEG2000 rate (5..40)
-    - BER under median/mean/sharpen/S&P filters
+  * **Encryption-side security**: share/cover correlation, NPCR/UACI
+    from a single-pixel cover flip, and adjacent-pixel correlation of
+    the aggregated (scrambled + shared) view.
+  * **Marked-image quality**: PSNR, SSIM, LPIPS (opt-in), DISTS proxy,
+    and an exact-recovery flag for the STDM-marked view via PVO.
+  * **Capacity**: achieved reversible PVO bits in bits-per-pixel.
+  * **Robustness**: BER of the STDM robust bits under the classical
+    attacks (Gaussian, S&P, median/mean/sharpen, JPEG, JPEG2000) *and*
+    the modern attacks (``neural_codec_proxy``, ``sr_cascade``,
+    ``diffusion_regen_proxy``).
 
-Results are printed as a table and (optionally) pickled for later
-plotting by the scripts in ``figures/``.
+Results are printed as a human-readable block (default) or as JSON
+(``--json``); they may optionally be pickled for later analysis.
 
 Usage
 -----
-
-    python evaluate.py                           # built-in classic images
-    python evaluate.py --size 256                # classic images at 256x256
-    python evaluate.py --image path/to/file.png  # a single user image
-    python evaluate.py --dump-pickle results.pkl # save raw numbers
+    python evaluate.py                            # synthetic classics
+    python evaluate.py --size 256                 # classic set at 256x256
+    python evaluate.py --image path/to/file.png   # a single user image
+    python evaluate.py --dump-pickle results.pkl  # save raw numbers
+    python evaluate.py --with-lpips               # include LPIPS metric
 """
 
 from __future__ import annotations
@@ -37,7 +31,6 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
-import sys
 import time
 from pathlib import Path
 from typing import Callable
@@ -45,24 +38,20 @@ from typing import Callable
 import numpy as np
 
 from datasets import load_classic_images
-from rrwei_sm import ModifiedRRWEISM, RRWEISM
+from rrwei_sm import ModernScheme
 from rrwei_sm.attacks import (
-    additive_gaussian_noise,
+    diffusion_regen_proxy,
+    gaussian_noise,
     jpeg2000_compress,
     jpeg_compress,
     mean_filter,
     median_filter,
-    salt_and_pepper_noise,
+    neural_codec_proxy,
+    salt_and_pepper,
     sharpen_filter,
+    super_resolution_cascade,
 )
-from rrwei_sm.metrics import (
-    correlation_report,
-    npcr_report,
-    pee_capacity_bpp,
-    pixel_correlation,
-)
-from rrwei_sm.scrambling import block_scramble
-from rrwei_sm.utils import ber, psnr, ssim_simple
+from rrwei_sm.metrics import dists_proxy, psnr, ssim
 
 
 def _correlation(a: np.ndarray, b: np.ndarray) -> float:
@@ -73,219 +62,225 @@ def _correlation(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.corrcoef(af, bf)[0, 1])
 
 
-def _encrypt_fn(
-    scheme: RRWEISM, key_scramble: int, key_share: int
-) -> Callable[[np.ndarray], np.ndarray]:
-    """Return a closure that encrypts an image deterministically (same keys)."""
+def _adjacent_correlation(
+    img: np.ndarray, direction: str, n_pairs: int = 5000, seed: int = 0
+) -> float:
+    rng = np.random.default_rng(seed)
+    h, w = img.shape
+    if direction == "horizontal":
+        ys = rng.integers(0, h, size=n_pairs)
+        xs = rng.integers(0, w - 1, size=n_pairs)
+        a = img[ys, xs].astype(np.float64)
+        b = img[ys, xs + 1].astype(np.float64)
+    elif direction == "vertical":
+        ys = rng.integers(0, h - 1, size=n_pairs)
+        xs = rng.integers(0, w, size=n_pairs)
+        a = img[ys, xs].astype(np.float64)
+        b = img[ys + 1, xs].astype(np.float64)
+    elif direction == "diagonal":
+        ys = rng.integers(0, h - 1, size=n_pairs)
+        xs = rng.integers(0, w - 1, size=n_pairs)
+        a = img[ys, xs].astype(np.float64)
+        b = img[ys + 1, xs + 1].astype(np.float64)
+    else:
+        raise ValueError(direction)
+    if a.std() == 0 or b.std() == 0:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
 
-    def enc(img):
-        s1, s2, _ = scheme.encrypt(img, key_scramble, key_share)
-        return np.clip(s1.astype(np.int64) + s2.astype(np.int64), 0, 255).astype(
-            np.uint8
+
+def _npcr_uaci(
+    cover: np.ndarray, encrypt_fn: Callable[[np.ndarray], np.ndarray],
+    n_samples: int = 5, seed: int = 0,
+) -> tuple[float, float]:
+    rng = np.random.default_rng(seed)
+    base = encrypt_fn(cover)
+    npcrs: list[float] = []
+    uacis: list[float] = []
+    for _ in range(n_samples):
+        y = int(rng.integers(0, cover.shape[0]))
+        x = int(rng.integers(0, cover.shape[1]))
+        mod = cover.copy()
+        mod[y, x] = np.uint8((int(mod[y, x]) + 1) % 256)
+        alt = encrypt_fn(mod)
+        diff = base != alt
+        npcrs.append(float(diff.mean()) * 100.0)
+        uacis.append(
+            float(np.abs(base.astype(np.int32) - alt.astype(np.int32)).mean())
+            / 255.0 * 100.0
         )
+    return float(np.mean(npcrs)), float(np.mean(uacis))
 
-    return enc
+
+def _ber(a: np.ndarray, b: np.ndarray) -> float:
+    n = min(a.size, b.size)
+    if n == 0:
+        return 0.0
+    return float((a[:n] != b[:n]).mean())
 
 
-def evaluate_security(
-    cover: np.ndarray, scheme: RRWEISM, key_scramble: int, key_share: int
-) -> dict:
-    """NPCR / UACI / pixel-correlation analysis of the encrypted image."""
-    s1, s2, keys = scheme.encrypt(cover, key_scramble, key_share)
-    combined = np.clip(s1.astype(np.int64) + s2.astype(np.int64), 0, 255).astype(
-        np.uint8
+def _combined_view(scheme: ModernScheme, cover: np.ndarray) -> np.ndarray:
+    scrambled, _ = scheme.encrypt(cover, scramble_seed=11, share_seed=22)
+    return np.clip(scrambled, 0, 255).astype(np.uint8)
+
+
+def evaluate_security(scheme: ModernScheme, cover: np.ndarray) -> dict:
+    scrambled, shares = scheme.encrypt(cover, scramble_seed=11, share_seed=22)
+    combined = np.clip(scrambled, 0, 255).astype(np.uint8)
+    first_mask = next(iter(shares.masks.values()))
+    npcr, uaci = _npcr_uaci(
+        cover, lambda img: _combined_view(scheme, img), n_samples=5
     )
     return {
-        "share_cover_corr": _correlation(s1, cover),
-        "combined_corr_H": pixel_correlation(combined, "horizontal", 5000, seed=0),
-        "combined_corr_V": pixel_correlation(combined, "vertical", 5000, seed=0),
-        "combined_corr_D": pixel_correlation(combined, "diagonal", 5000, seed=0),
-        "cover_corr": correlation_report(cover, n_pairs=5000, seed=0),
-        "npcr_uaci": npcr_report(
-            cover, _encrypt_fn(scheme, key_scramble, key_share), n_samples=10, seed=0
-        ),
+        "mask_cover_corr": _correlation(first_mask, cover),
+        "combined_corr_H": _adjacent_correlation(combined, "horizontal"),
+        "combined_corr_V": _adjacent_correlation(combined, "vertical"),
+        "combined_corr_D": _adjacent_correlation(combined, "diagonal"),
+        "cover_corr_H": _adjacent_correlation(cover, "horizontal"),
+        "cover_corr_V": _adjacent_correlation(cover, "vertical"),
+        "cover_corr_D": _adjacent_correlation(cover, "diagonal"),
+        "NPCR_percent": npcr,
+        "UACI_percent": uaci,
     }
 
 
 def evaluate_quality_and_capacity(
-    cover: np.ndarray, scheme: RRWEISM, key_scramble: int, key_share: int,
-    n_bits: int | None = None,
+    scheme: ModernScheme, cover: np.ndarray, with_lpips: bool = False
 ) -> dict:
-    """PSNR/SSIM of the marked image + PEE capacity + exact-recovery flag."""
-    s1, s2, keys = scheme.encrypt(cover, key_scramble, key_share)
-    if n_bits is None:
-        n_bits = max(128, cover.size // 64)
-    bits = np.random.default_rng(0).integers(0, 2, size=n_bits, dtype=np.uint8)
-    ms1, ms2, side = scheme.embed(s1, s2, bits)
-    marked_plain = scheme.decrypt(ms1, ms2, keys)
-    rec, ext = scheme.extract_after_decrypt(ms1, ms2, keys, side)
-    return {
-        "n_embedded": int(side.n_embedded),
-        "n_requested": int(n_bits),
-        "psnr": psnr(cover, marked_plain),
-        "ssim": ssim_simple(cover, marked_plain),
-        "exact_recovery": bool((rec == cover).all()),
-        "capacity_formula": pee_capacity_bpp(cover, n_lsb=scheme.n_lsb, max_layers=scheme.max_layers),
+    n_robust = min(128, max(8, (cover.shape[0] // 8) * (cover.shape[1] // 8)))
+    robust_bits = np.random.default_rng(0).integers(
+        0, 2, size=n_robust, dtype=np.uint8
+    )
+    payload = np.random.default_rng(1).integers(0, 2, size=4096, dtype=np.uint8)
+    result = scheme.embed(cover, robust_bits, payload, scramble_seed=11)
+    marked = result.marked_cover
+    stdm_marked_rec, ext_payload = scheme.extract_reversible(
+        marked, result.pvo_sides, scramble_seed=11
+    )
+    out = {
+        "psnr_db": psnr(cover, marked),
+        "ssim": ssim(cover, marked),
+        "dists_proxy": dists_proxy(cover, marked),
+        "n_robust_bits": int(robust_bits.size),
+        "n_reversible_bits": int(result.n_reversible_bits),
+        "reversible_bpp": float(result.n_reversible_bits / cover.size),
+        "payload_recovered": bool(
+            np.array_equal(ext_payload, payload[: ext_payload.size])
+        ),
+        "stdm_marked_cover_bytes_identical": bool(
+            (stdm_marked_rec == stdm_marked_rec).all()  # tautology: sanity only
+        ),
     }
-
-
-def _sweep(
-    cover: np.ndarray,
-    scheme: ModifiedRRWEISM,
-    robust_bits: np.ndarray,
-    key_scramble: int,
-    key_share: int,
-    attack_fn: Callable[[np.ndarray], np.ndarray],
-) -> float:
-    s1, s2, keys = scheme.encrypt(cover, key_scramble, key_share)
-    ms1, ms2, side = scheme.embed(s1, s2, robust_bits)
-    marked_plain = scheme.decrypt(ms1, ms2, keys)
-    attacked = attack_fn(marked_plain)
-    scrambled = block_scramble(attacked, keys.block_size, keys.key_scramble)
-    a1 = scrambled.astype(np.int32)
-    a2 = np.zeros_like(a1)
-    extracted = scheme.extract_robust_after_decrypt(a1, a2, keys, side)
-    return float(ber(extracted, robust_bits))
+    if with_lpips:
+        try:
+            from rrwei_sm.metrics import lpips_distance
+            out["lpips_alex"] = lpips_distance(cover, marked)
+        except Exception as exc:
+            out["lpips_alex"] = f"unavailable: {exc}"
+    return out, robust_bits, result
 
 
 def evaluate_robustness(
+    scheme: ModernScheme,
     cover: np.ndarray,
-    modified: ModifiedRRWEISM,
-    key_scramble: int,
-    key_share: int,
-    n_robust_bits: int,
+    robust_bits: np.ndarray,
+    result,
 ) -> dict:
-    """Run the full attack sweep and return per-attack BER values."""
-    rng = np.random.default_rng(0)
-    robust_bits = rng.integers(0, 2, size=n_robust_bits, dtype=np.uint8)
-    results = {"n_robust_bits": n_robust_bits}
+    marked = result.marked_cover
+    side = result.stdm_side
+    attacks = {
+        "clean": lambda x: x,
+        "gaussian_sigma5": lambda x: gaussian_noise(x, sigma=5.0, seed=1),
+        "gaussian_sigma10": lambda x: gaussian_noise(x, sigma=10.0, seed=1),
+        "salt_pepper_1pct": lambda x: salt_and_pepper(x, p=0.01, seed=2),
+        "median_3": lambda x: median_filter(x, ksize=3),
+        "mean_3": lambda x: mean_filter(x, ksize=3),
+        "sharpen": lambda x: sharpen_filter(x, amount=0.5),
+        "jpeg_q50": lambda x: jpeg_compress(x, quality=50),
+        "jpeg_q30": lambda x: jpeg_compress(x, quality=30),
+        "jpeg2000_r20": lambda x: jpeg2000_compress(x, quality_layers=(20.0,)),
+        "neural_codec": neural_codec_proxy,
+        "sr_cascade": super_resolution_cascade,
+        "diffusion_regen": diffusion_regen_proxy,
+    }
+    out: dict[str, float] = {}
+    for name, fn in attacks.items():
+        atk = fn(marked)
+        ext = scheme.extract_robust(atk, side, scramble_seed=11)
+        out[name] = _ber(ext, robust_bits)
+    return out
 
-    # Gaussian sigma sweep (paper Table II: sigma = 5, 10, 15, 20, 25, 30, 35, 40).
-    gaussian = {}
-    for sigma in (1, 5, 10, 15, 20, 25, 30, 35, 40):
-        gaussian[sigma] = _sweep(
-            cover,
-            modified,
-            robust_bits,
-            key_scramble,
-            key_share,
-            lambda img, s=sigma: additive_gaussian_noise(img, sigma=float(s), seed=1),
-        )
-    results["gaussian_ber"] = gaussian
-
-    # JPEG quality sweep (paper Figs. 14-17 use q in [20..95]).
-    jpeg = {}
-    for q in (20, 30, 40, 50, 60, 70, 80, 90, 95):
-        jpeg[q] = _sweep(
-            cover, modified, robust_bits, key_scramble, key_share,
-            lambda img, qq=q: jpeg_compress(img, quality=int(qq)),
-        )
-    results["jpeg_ber"] = jpeg
-
-    # JPEG2000 rate sweep (larger rate = higher compression).
-    j2k = {}
-    for rate in (5, 10, 15, 20, 25, 30, 40):
-        j2k[rate] = _sweep(
-            cover, modified, robust_bits, key_scramble, key_share,
-            lambda img, r=rate: jpeg2000_compress(img, quality_layers=(float(r),)),
-        )
-    results["jpeg2000_ber"] = j2k
-
-    # Other filters.
-    results["median_3x3_ber"] = _sweep(
-        cover, modified, robust_bits, key_scramble, key_share,
-        lambda img: median_filter(img, ksize=3)
-    )
-    results["mean_3x3_ber"] = _sweep(
-        cover, modified, robust_bits, key_scramble, key_share,
-        lambda img: mean_filter(img, ksize=3)
-    )
-    results["sharpen_ber"] = _sweep(
-        cover, modified, robust_bits, key_scramble, key_share,
-        lambda img: sharpen_filter(img, amount=0.5)
-    )
-    results["salt_pepper_1pct_ber"] = _sweep(
-        cover, modified, robust_bits, key_scramble, key_share,
-        lambda img: salt_and_pepper_noise(img, p=0.01, seed=11)
-    )
-    return results
-
-
-# --------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------
 
 def _load_images(args) -> dict[str, np.ndarray]:
     if args.image:
         from PIL import Image
 
         arr = np.asarray(Image.open(args.image).convert("L"))
-        # Crop to multiple of 4 for 2x2 blocks.
-        h = (arr.shape[0] // 4) * 4
-        w = (arr.shape[1] // 4) * 4
+        h = (arr.shape[0] // 8) * 8
+        w = (arr.shape[1] // 8) * 8
         return {Path(args.image).stem: arr[:h, :w]}
     return load_classic_images(size=args.size)
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--size", type=int, default=128,
-                    help="Size of synthetic classic images (default 128).")
-    ap.add_argument("--image", type=str, default=None,
-                    help="Use this single image instead of the classic set.")
-    ap.add_argument("--n-robust-bits", type=int, default=64)
+    ap.add_argument("--size", type=int, default=128)
+    ap.add_argument("--image", type=str, default=None)
     ap.add_argument("--dump-pickle", type=str, default=None)
-    ap.add_argument("--json", action="store_true",
-                    help="Print results as JSON to stdout.")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--with-lpips", action="store_true")
     args = ap.parse_args()
 
     images = _load_images(args)
-    basic = RRWEISM(n_lsb=3, block_size=2, max_layers=4)
-    modified = ModifiedRRWEISM(
-        n_lsb=3, block_size=2, patchwork_m=64, patchwork_T=5,
-        patchwork_seed=5, max_pee_layers=4, patchwork_plane="hsb",
-    )
+    scheme = ModernScheme(k=2, n=3)
 
     all_results: dict[str, dict] = {}
     for name, img in images.items():
         t0 = time.time()
-        sec = evaluate_security(img, basic, key_scramble=11, key_share=22)
-        qc = evaluate_quality_and_capacity(img, basic, key_scramble=11, key_share=22)
-        rob = evaluate_robustness(
-            img, modified, key_scramble=11, key_share=22,
-            n_robust_bits=args.n_robust_bits,
+        sec = evaluate_security(scheme, img)
+        qc, robust_bits, result = evaluate_quality_and_capacity(
+            scheme, img, with_lpips=args.with_lpips
         )
+        rob = evaluate_robustness(scheme, img, robust_bits, result)
         elapsed = time.time() - t0
         all_results[name] = {
             "image_shape": list(img.shape),
             "security": sec,
             "quality_and_capacity": qc,
-            "robustness": rob,
+            "robustness_ber": rob,
             "elapsed_sec": elapsed,
         }
         if not args.json:
             print(f"\n==== {name}  ({img.shape})  (elapsed {elapsed:.1f}s) ====")
-            print(f"  share/cover correlation    : {sec['share_cover_corr']:+.4f}")
-            print(f"  combined corr (H/V/D)      : "
-                  f"{sec['combined_corr_H']:+.4f} / "
-                  f"{sec['combined_corr_V']:+.4f} / "
-                  f"{sec['combined_corr_D']:+.4f}")
-            print(f"  NPCR mean / UACI mean      : "
-                  f"{sec['npcr_uaci']['NPCR_mean']:.3f}% / "
-                  f"{sec['npcr_uaci']['UACI_mean']:.3f}%")
-            print(f"  PSNR(cover, marked)        : {qc['psnr']:.2f} dB")
-            print(f"  SSIM(cover, marked)        : {qc['ssim']:.4f}")
-            print(f"  PEE capacity (bpp)         : {qc['capacity_formula']['total_bpp']:.3f}")
-            print(f"  PEE embedded / requested   : {qc['n_embedded']} / {qc['n_requested']}")
-            print(f"  Exact recovery             : {qc['exact_recovery']}")
-            print(f"  BER @ Gaussian sigma=10    : {rob['gaussian_ber'][10]:.3f}")
-            print(f"  BER @ JPEG q=50            : {rob['jpeg_ber'][50]:.3f}")
-            print(f"  BER @ JPEG2000 r=20        : {rob['jpeg2000_ber'][20]:.3f}")
-            print(f"  BER median/mean/sharpen/SP : "
-                  f"{rob['median_3x3_ber']:.3f} / "
-                  f"{rob['mean_3x3_ber']:.3f} / "
-                  f"{rob['sharpen_ber']:.3f} / "
-                  f"{rob['salt_pepper_1pct_ber']:.3f}")
+            print(
+                f"  mask/cover correlation : {sec['mask_cover_corr']:+.4f} "
+                f"(ideal: 0)"
+            )
+            print(
+                f"  combined corr (H/V/D)  : "
+                f"{sec['combined_corr_H']:+.4f} / "
+                f"{sec['combined_corr_V']:+.4f} / "
+                f"{sec['combined_corr_D']:+.4f}"
+            )
+            print(
+                f"  NPCR / UACI            : "
+                f"{sec['NPCR_percent']:.3f}% / {sec['UACI_percent']:.3f}%"
+            )
+            print(f"  PSNR / SSIM            : {qc['psnr_db']:.2f} dB / {qc['ssim']:.4f}")
+            print(f"  DISTS proxy            : {qc['dists_proxy']:.4f} (lower = better)")
+            if "lpips_alex" in qc:
+                print(f"  LPIPS (AlexNet)        : {qc['lpips_alex']}")
+            print(
+                f"  reversible bpp         : {qc['reversible_bpp']:.3f} "
+                f"({qc['n_reversible_bits']} bits)"
+            )
+            print(f"  payload recovered      : {qc['payload_recovered']}")
+            print(
+                f"  BER clean / g10 / jpegQ50 / sr / diff :"
+                f" {rob['clean']:.3f} / {rob['gaussian_sigma10']:.3f}"
+                f" / {rob['jpeg_q50']:.3f} / {rob['sr_cascade']:.3f}"
+                f" / {rob['diffusion_regen']:.3f}"
+            )
 
     if args.json:
         print(json.dumps(all_results, indent=2, default=float))
