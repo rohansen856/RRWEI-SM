@@ -7,7 +7,7 @@ import zlib
 import numpy as np
 import pytest
 
-from rrwei_sm_modern.coding import decode_symbols, encode_symbols, estimate_pmf
+from rrwei_sm.coding import decode_symbols, encode_symbols, estimate_pmf
 
 
 def test_round_trip_small():
