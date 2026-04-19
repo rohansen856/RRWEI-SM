@@ -26,3 +26,6 @@ Thumbs.db
 # Local outputs
 figures/out/
 *.pkl
+
+# Downloaded real-image cache
+assets/test_images/
