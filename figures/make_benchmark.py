@@ -1,40 +1,43 @@
 #!/usr/bin/env python3
-"""
-figures/make_benchmark.py -> figures/out/benchmark_on.png
+"""figures/make_benchmark.py -> figures/out/benchmark_on.png
 
-Reproduces the style of the paper's complexity-analysis figure:
-per-pixel wall time for encrypt/decrypt/embed across image sizes,
-showing the O(n) scaling.  A successful O(n) implementation yields
-roughly-flat per-pixel timings.
+Per-pixel wall time for scramble / share / STDM / PVO vs image size.
+Flat lines confirm the O(n) claim from the paper.
 """
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from figures._common import ensure_figure_dir, mpl
-from benchmark import benchmark_sizes
+
+from benchmark_modern import benchmark
 
 
-def main():
+def main() -> None:
     plt = mpl()
     sizes = [64, 128, 256, 512]
-    fig, axs = plt.subplots(1, 2, figsize=(11.0, 4.0))
-    for scrambler, ax, title in [
-        ("random", axs[0], "seeded-random 2x2 scrambler"),
-        ("hua", axs[1], "Hua et al. 2D-LSCM scrambler"),
-    ]:
-        rs = benchmark_sizes(sizes, n_repeats=3, scrambler=scrambler)
-        xs = [r["n_pixels"] for r in rs]
-        ax.plot(xs, [r["encrypt_ns_per_px"] for r in rs], "o-", label="encrypt")
-        ax.plot(xs, [r["decrypt_ns_per_px"] for r in rs], "s-", label="decrypt")
-        ax.plot(xs, [r["embed_ns_per_px"] for r in rs], "^-", label="embed")
-        ax.set_xscale("log", base=2)
-        ax.set_xlabel("pixels")
-        ax.set_ylabel("ns / pixel")
-        ax.set_title(f"Per-pixel wall time  ({title})")
-        ax.legend()
-    out = ensure_figure_dir() / "benchmark_on.png"
+    rs = benchmark(sizes, n_repeats=2)
+
+    xs = [r["n_pixels"] for r in rs]
+    fig, ax = plt.subplots(figsize=(7.0, 4.2))
+    ax.plot(xs, [r["scramble_ns_per_px"] for r in rs], "o-", label="scramble")
+    ax.plot(xs, [r["share_ns_per_px"] for r in rs], "s-", label="share")
+    ax.plot(xs, [r["stdm_ns_per_px"] for r in rs], "^-", label="STDM embed")
+    ax.plot(xs, [r["pvo_ns_per_px"] for r in rs], "d-", label="PVO embed (Numba)")
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("n (pixels)")
+    ax.set_ylabel("ns / pixel")
+    ax.set_title("Per-pixel wall time (flat = O(n))")
+    ax.legend()
     fig.tight_layout()
-    fig.savefig(out, dpi=150)
+
+    out = ensure_figure_dir() / "benchmark_on.png"
+    fig.savefig(out, dpi=160)
+    plt.close(fig)
     print(f"Wrote {out}")
 
 

@@ -2,7 +2,7 @@
 
 Runs the STDM embedder on the three synthetic covers, passes the
 marked image through every attack in
-``rrwei_sm_modern.attacks.AVAILABLE_ATTACKS``, and plots the per-cover
+``rrwei_sm.attacks.AVAILABLE_ATTACKS``, and plots the per-cover
 BER as a grouped bar chart.
 """
 
@@ -18,8 +18,8 @@ import numpy as np
 from figures._common import ensure_figure_dir, mpl
 
 from datasets import load_classic_images
-from rrwei_sm_modern.attacks import AVAILABLE_ATTACKS
-from rrwei_sm_modern.stdm import STDMConfig, embed, extract
+from rrwei_sm.attacks import AVAILABLE_ATTACKS
+from rrwei_sm.stdm import STDMConfig, embed, extract
 
 
 def main() -> None:
