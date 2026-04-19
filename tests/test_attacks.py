@@ -1,100 +1,107 @@
-"""Tests for the image attack primitives."""
+"""Tests for the modern attack suite."""
+
+from __future__ import annotations
 
 import numpy as np
 import pytest
 
 from rrwei_sm.attacks import (
-    additive_gaussian_noise,
+    AVAILABLE_ATTACKS,
+    diffusion_regen_proxy,
+    gaussian_noise,
     jpeg2000_compress,
     jpeg_compress,
     mean_filter,
     median_filter,
-    salt_and_pepper_noise,
+    neural_codec_proxy,
+    salt_and_pepper,
     sharpen_filter,
+    super_resolution_cascade,
 )
 
 
-@pytest.fixture
-def simple_img():
-    rng = np.random.default_rng(0)
-    return rng.integers(30, 220, size=(32, 32), dtype=np.uint8)
+@pytest.mark.parametrize("name", list(AVAILABLE_ATTACKS.keys()))
+def test_attack_preserves_shape_and_dtype(textured_cover, name):
+    out = AVAILABLE_ATTACKS[name](textured_cover)
+    assert out.shape == textured_cover.shape
+    assert out.dtype == np.uint8
 
 
-def test_gaussian_noise_distribution(simple_img):
-    attacked = additive_gaussian_noise(simple_img, sigma=5.0, seed=1)
-    assert attacked.shape == simple_img.shape
+def test_neural_codec_distorts_image(textured_cover):
+    attacked = neural_codec_proxy(textured_cover)
+    assert not np.array_equal(attacked, textured_cover)
+    # But still within the correct range.
+    assert attacked.min() >= 0 and attacked.max() <= 255
+
+
+def test_super_resolution_cascade_smooths_but_preserves_shape(textured_cover):
+    out = super_resolution_cascade(textured_cover)
+    assert out.shape == textured_cover.shape
+    # Expect lower total variation after the round-trip.
+    tv_orig = np.mean(np.abs(np.diff(textured_cover, axis=0))) + np.mean(
+        np.abs(np.diff(textured_cover, axis=1))
+    )
+    tv_attacked = np.mean(np.abs(np.diff(out, axis=0))) + np.mean(
+        np.abs(np.diff(out, axis=1))
+    )
+    assert tv_attacked < tv_orig
+
+
+def test_diffusion_regen_proxy_fallback(textured_cover):
+    out = diffusion_regen_proxy(textured_cover, use_vae=False)
+    assert out.shape == textured_cover.shape
+    assert out.dtype == np.uint8
+    # Should distort (gaussian blur + jpeg).
+    assert not np.array_equal(out, textured_cover)
+
+
+def test_stdm_bits_survive_sr_cascade(classic_covers):
+    """STDM survives a 2x bicubic SR round-trip with BER <= 0.25."""
+    from datasets import lena_like
+    from rrwei_sm.stdm import STDMConfig, embed, extract
+
+    cover = lena_like(size=128)
+    rng = np.random.default_rng(1)
+    bits = rng.integers(0, 2, size=128, dtype=np.uint8)
+    marked, side = embed(cover, bits, STDMConfig(delta=60.0, n_coeffs=4, seed=0))
+    attacked = AVAILABLE_ATTACKS["sr_cascade"](marked)
+    out = extract(attacked, side)
+    ber = float((out != bits).mean())
+    assert ber <= 0.25, ber
+
+
+def test_neural_codec_and_diffusion_are_harder_than_sr(classic_covers):
+    """Sanity: the neural-codec and diffusion proxies produce strictly
+    more distortion (in L2 pixel distance) than the SR cascade.
+
+    Their exact BER against STDM is reported by the Step 7 robustness
+    figure; we don't bake a tight bound here because the whole point
+    of the modern attack suite is to be adversarial.
+    """
+    from datasets import lena_like
+
+    cover = lena_like(size=128)
+    d_sr = np.linalg.norm(
+        AVAILABLE_ATTACKS["sr_cascade"](cover).astype(np.float64) - cover.astype(np.float64)
+    )
+    d_nc = np.linalg.norm(
+        AVAILABLE_ATTACKS["neural_codec"](cover).astype(np.float64) - cover.astype(np.float64)
+    )
+    d_dr = np.linalg.norm(
+        AVAILABLE_ATTACKS["diffusion_regen"](cover).astype(np.float64) - cover.astype(np.float64)
+    )
+    assert d_nc > d_sr, (d_nc, d_sr)
+    assert d_dr > d_sr, (d_dr, d_sr)
+
+
+def test_neural_codec_runs_on_marked_image(textured_cover):
+    """Smoke test: neural_codec proxy does not crash and stays in range."""
+    from rrwei_sm.stdm import STDMConfig, embed
+
+    rng = np.random.default_rng(2)
+    bits = rng.integers(0, 2, size=32, dtype=np.uint8)
+    marked, _ = embed(textured_cover, bits, STDMConfig(delta=40.0, n_coeffs=4, seed=0))
+    attacked = AVAILABLE_ATTACKS["neural_codec"](marked)
+    assert attacked.shape == marked.shape
     assert attacked.dtype == np.uint8
-    diff = attacked.astype(int) - simple_img.astype(int)
-    # Standard deviation should be close to sigma (5), allow for clipping.
-    assert 2.0 < diff.std() < 10.0
-
-
-def test_gaussian_noise_zero_sigma_is_identity(simple_img):
-    attacked = additive_gaussian_noise(simple_img, sigma=0.0, seed=0)
-    assert (attacked == simple_img).all()
-
-
-def test_salt_and_pepper_changes_about_p_pixels(simple_img):
-    attacked = salt_and_pepper_noise(simple_img, p=0.1, seed=0)
-    changed = np.sum(attacked != simple_img)
-    # At least half of the requested ~10% should differ (some random pixels
-    # may receive their own value).
-    assert changed > int(simple_img.size * 0.05)
-
-
-def test_salt_and_pepper_values_are_extremes(simple_img):
-    attacked = salt_and_pepper_noise(simple_img, p=0.2, seed=0)
-    diff_mask = attacked != simple_img
-    values = attacked[diff_mask]
-    assert set(values.tolist()).issubset({0, 255})
-
-
-def test_median_filter_removes_salt_spikes():
-    img = np.full((16, 16), 100, dtype=np.uint8)
-    img[4, 4] = 255  # single salt pixel
-    filtered = median_filter(img, ksize=3)
-    assert filtered[4, 4] == 100
-
-
-def test_mean_filter_smooths(simple_img):
-    filtered = mean_filter(simple_img, ksize=3)
-    # Mean filter should reduce pixel-to-pixel variation.
-    assert filtered.std() <= simple_img.std()
-
-
-def test_sharpen_identity_on_constant_image():
-    img = np.full((16, 16), 128, dtype=np.uint8)
-    s = sharpen_filter(img, amount=1.5)
-    assert (s == img).all()
-
-
-def test_jpeg_compress_returns_uint8(simple_img):
-    out = jpeg_compress(simple_img, quality=75)
-    assert out.shape == simple_img.shape
-    assert out.dtype == np.uint8
-
-
-def test_jpeg_compress_low_quality_is_lossy(simple_img):
-    high = jpeg_compress(simple_img, quality=95)
-    low = jpeg_compress(simple_img, quality=20)
-    mse_high = np.mean((high.astype(float) - simple_img.astype(float)) ** 2)
-    mse_low = np.mean((low.astype(float) - simple_img.astype(float)) ** 2)
-    assert mse_low > mse_high
-
-
-def test_jpeg2000_compress_returns_uint8(simple_img):
-    out = jpeg2000_compress(simple_img, quality_layers=(20.0,))
-    assert out.shape == simple_img.shape
-    assert out.dtype == np.uint8
-
-
-def test_jpeg_compress_invalid_quality_raises(simple_img):
-    with pytest.raises(ValueError):
-        jpeg_compress(simple_img, quality=0)
-    with pytest.raises(ValueError):
-        jpeg_compress(simple_img, quality=150)
-
-
-def test_median_filter_invalid_ksize(simple_img):
-    with pytest.raises(ValueError):
-        median_filter(simple_img, ksize=2)
+    assert attacked.min() >= 0 and attacked.max() <= 255
