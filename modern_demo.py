@@ -120,7 +120,33 @@ def main() -> int:
     if "rrwei_sm_modern.pvo" in imported:
         _step5_pvo_capacity()
 
+    if "rrwei_sm_modern.metrics" in imported:
+        _step6_perceptual_metrics()
+
     return 0
+
+
+def _step6_perceptual_metrics() -> None:
+    """Step 6 gate: LPIPS + DISTS proxy on marked images."""
+    from datasets import load_classic_images
+    from rrwei_sm_modern.metrics import dists_proxy, lpips_distance, psnr, ssim
+    from rrwei_sm_modern.stdm import STDMConfig, embed as stdm_embed
+
+    print("\n== Step 6: Perceptual metrics (LPIPS + DISTS-proxy) ==")
+    covers = load_classic_images(size=128)
+    rng = np.random.default_rng(17)
+    header = f"{'cover':<14} {'PSNR':>7} {'SSIM':>6} {'LPIPS':>6} {'DISTS':>6}"
+    print(f"  {header}")
+    for name, cover in covers.items():
+        bits = rng.integers(0, 2, size=128, dtype=np.uint8)
+        marked, _ = stdm_embed(cover, bits, STDMConfig(delta=16, n_coeffs=4, seed=1))
+        vals = [
+            f"{psnr(cover, marked):7.2f}",
+            f"{ssim(cover, marked):6.3f}",
+            f"{lpips_distance(cover, marked):6.3f}",
+            f"{dists_proxy(cover, marked):6.3f}",
+        ]
+        print(f"  {name:<14}" + " ".join(vals))
 
 
 def _step5_pvo_capacity() -> None:
