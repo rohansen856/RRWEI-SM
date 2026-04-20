@@ -1,6 +1,6 @@
-# RRWEI-SM: Robust Reversible Watermarking in Encrypted Image with Secure Multi-Party
+# RRWEI-SM (modernized)
 
-A dependency-light Python implementation of the schemes in:
+A dependency-light Python implementation of the paper
 
 > Lizhi Xiong, Xiao Han, Ching-Nung Yang, Yun-Qing Shi.
 > *"Robust Reversible Watermarking in Encrypted Image With Secure
@@ -8,29 +8,22 @@ A dependency-light Python implementation of the schemes in:
 > IEEE Transactions on Circuits and Systems for Video Technology,
 > Vol. 32, No. 1, pp. 75-91, January 2022.
 
-The paper proposes two schemes:
+This branch (`modernization`) replaces each legacy building block with a
+modern equivalent while preserving the paper's architecture:
 
-1. **RRWEI-SM** -- lightweight image encryption (additive secret sharing
-   + block-level scrambling) followed by HSB-plane Prediction Error
-   Expansion (PEE) performed via a Secure Multi-Party Computation
-   protocol.
-2. **Modified RRWEI-SM** -- a two-stage variant that first embeds a
-   patchwork robust watermark, then reversibly embeds the side
-   information via PEE.
+| Stage                        | Paper primitive                 | Modern replacement                                    |
+|------------------------------|---------------------------------|-------------------------------------------------------|
+| Encryption                   | Additive share + Hua 2D-LSCM    | **ChaCha20** stream + block permutation               |
+| Secret sharing               | 2-party additive                | **(k, n) replicated** shares                          |
+| Robust watermark             | Patchwork on HSB plane          | **STDM** (quantized DCT dither modulation)            |
+| Side-information compression | zlib                            | **rANS** entropy coder                                |
+| Reversible payload           | HSB Prediction-Error Expansion  | **PVO + pairwise PEE** (Numba-JIT)                    |
+| Imperceptibility             | PSNR / SSIM                     | PSNR / SSIM + **LPIPS** + **DISTS-proxy**             |
+| Attacks                      | Gaussian / S&P / JPEG / JPEG2K  | + **neural codec**, **SR cascade**, **diffusion** proxies |
 
-Both schemes:
-
-* preserve the privacy of the cover image (additive shares act as a
-  one-time pad),
-* are fully **separable** (extraction order with respect to decryption
-  is free),
-* support **k-party** copyright protection (`n_parties >= 2`),
-* recover the cover image **exactly** when the marked image is intact,
-* have **robust** watermark extraction under mild attacks (Modified
-  scheme).
-
-Full transparency about what could and could not be reproduced verbatim
-from the paper lives in [LIMITATIONS.md](LIMITATIONS.md).
+See [`MODERNIZATION.md`](MODERNIZATION.md) for the component-by-component
+rationale and measured gains, and [`FIGURES.md`](FIGURES.md) for a
+research-paper-style empirical evaluation of every committed figure.
 
 ## Quick start
 
@@ -39,176 +32,185 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# End-to-end demo on a built-in synthetic cover
+# End-to-end demo on a synthetic cover
 python demo.py
 
-# On your own image (grayscale PNG/JPEG; cropped to a multiple of 4)
-python demo.py path/to/image.png
-
-# Full test suite (96 tests, ~0.5s)
+# Full test suite (unit tests for every modern module)
 pytest tests/ -q
-
-# Reproduce all experimental results from the paper
-python evaluate.py --size 128
-python benchmark.py --sizes 64 128 256 --n-repeats 3
-python -m figures.make_all
 ```
 
-## What's implemented (paper items 1-14)
+## Modern API
 
-| # | Paper component                                    | Module / file                              |
-|---|----------------------------------------------------|--------------------------------------------|
-| 1 | Additive secret sharing (2-party, k-party)         | `rrwei_sm/secret_sharing.py`               |
-| 2 | HSB/LSB split with carry-aware invariants          | `rrwei_sm/secret_sharing.py`               |
-| 3 | Block-level scrambling (random permutation)        | `rrwei_sm/scrambling.py`                   |
-| 4 | Block-level scrambling (Hua et al. 2018, 2D-LSCM)  | `rrwei_sm/hua_scrambling.py`               |
-| 5 | Block-level HSB PEE + histogram shift              | `rrwei_sm/pee.py`                          |
-| 6 | SMC contribution additivity self-check             | `rrwei_sm/pee.py`                          |
-| 7 | Basic RRWEI-SM (separable, k-party)                | `rrwei_sm/rrwei_sm.py`                     |
-| 8 | Patchwork robust watermark (full-plane + HSB-plane)| `rrwei_sm/patchwork.py`, `modified_rrwei_sm.py` |
-| 9 | Two-stage Modified RRWEI-SM                        | `rrwei_sm/modified_rrwei_sm.py`            |
-| 10| zlib-based side-info compression                   | `rrwei_sm/modified_rrwei_sm.py`            |
-| 11| PSNR, SSIM, BER, NPCR, UACI, H/V/D correlation, Eq. 28 capacity | `rrwei_sm/utils.py`, `metrics.py` |
-| 12| Gaussian / S&P / median / mean / sharpen / JPEG / JPEG2000 attacks | `rrwei_sm/attacks.py` |
-| 13| Evaluation harness over classic images             | `datasets/`, `evaluate.py`                 |
-| 14| Benchmarks + matplotlib PNG figures                | `benchmark.py`, `figures/make_*.py`        |
+```python
+import numpy as np
+from rrwei_sm import ModernScheme, STDMConfig
 
-## Architecture
+rng = np.random.default_rng(0)
+cover = rng.integers(0, 256, (256, 256), dtype=np.uint8)
+
+scheme = ModernScheme(
+    stdm=STDMConfig(delta=60, n_bits=128),   # robust watermark strength / length
+    n_shares=3, threshold=2,                 # (2, 3) replicated sharing
+    block_size=8,                             # ChaCha20 scramble block size
+    key=b"0" * 32,                           # 32-byte ChaCha20 key
+)
+
+robust_bits = rng.integers(0, 2, 128, dtype=np.uint8)
+payload_bits = rng.integers(0, 2, 4096, dtype=np.uint8)
+
+result = scheme.embed(cover, robust_bits=robust_bits, payload_bits=payload_bits)
+# result -> {"marked", "side_info", "shares", "psnr_db", ...}
+
+rec_robust = scheme.extract_robust(result["marked"], result["side_info"])
+rec_cover, rec_payload = scheme.extract_reversible(result["marked"], result["side_info"])
+```
+
+Public re-exports live in [`rrwei_sm/__init__.py`](rrwei_sm/__init__.py).
+
+## Repository layout
 
 ```
 rrwei_sm/
-├── secret_sharing.py       # 2-party + k-party additive share, HSB/LSB split (Eqs. 7-14)
-├── scrambling.py           # random block permutation (seeded)
-├── hua_scrambling.py       # Hua et al. 2018 2D-LSCM chaotic block scrambler (ref [38])
-├── pee.py                  # HSB-plane PEE primitives (Eqs. 15-22) + SMC self-check
-├── patchwork.py            # patchwork robust watermark (Eqs. 23-27)
-├── rrwei_sm.py             # basic RRWEI-SM orchestrator (encrypt / embed / decrypt)
-├── modified_rrwei_sm.py    # Modified RRWEI-SM (two-stage, HSB-plane-aware)
-├── metrics.py              # NPCR, UACI, H/V/D correlation, PEE capacity (Eq. 28)
-├── attacks.py              # noise, filter, JPEG/JPEG2000 attack primitives
-└── utils.py                # PSNR, BER, SSIM, bit-packing helpers
-datasets/                   # synthetic Lena/Baboon/Peppers-like covers
-figures/                    # matplotlib figure generators
-evaluate.py                 # dataset-wide evaluation (quality + robustness + metrics)
-benchmark.py                # timing harness for O(n) verification
+├── crypto_scrambler.py     # ChaCha20 block scrambler
+├── secret_sharing.py       # legacy 2-party additive (kept for ablation)
+├── threshold_sharing.py    # (k, n) replicated secret shares
+├── stdm.py                 # Spread Transform Dither Modulation
+├── coding.py               # rANS entropy coder for side info
+├── pvo.py                  # Pixel-Value-Ordering PEE (Numba-JIT)
+├── metrics.py              # PSNR, SSIM, BER, LPIPS, DISTS-proxy, NPCR/UACI
+├── attacks.py              # classical + neural + SR + diffusion proxies
+└── orchestrator.py         # ModernScheme (end-to-end pipeline)
+
+tests/                      # unit tests, one per module (pytest)
+figures/                    # matplotlib generators for every plot in FIGURES.md
+figures/out/                # committed scripted outputs (.png)
 ```
 
-### Basic API
+## Pipeline tools (not core library code)
 
-```python
-from rrwei_sm import RRWEISM
+These scripts wrap the library to produce the empirical artifacts in
+`FIGURES.md` and `MODERNIZATION.md`. They are the "pipeline glue" --
+nothing in `rrwei_sm/` depends on them.
 
-scheme = RRWEISM(n_lsb=3, max_layers=4, scrambler="hua", n_parties=2)
+### `demo.py` -- minimal round-trip demo
 
-share1, share2, keys = scheme.encrypt(cover, key_scramble=7, key_share=13)
-marked1, marked2, side = scheme.embed(share1, share2, bits)
-
-# Separable: either order works.
-rec_s1, rec_s2, ext = scheme.extract_before_decrypt(marked1, marked2, side)
-cover_back, ext     = scheme.extract_after_decrypt(marked1, marked2, keys, side)
-
-# k-party (n_parties >= 2)
-scheme_k = RRWEISM(n_parties=4)
-shares, keys = scheme_k.encrypt_k(cover, key_scramble=0, key_share=0)
-marked, side = scheme_k.embed_k(shares, owner_idx=0, bits=bits)
-cover_back = scheme_k.decrypt_k(marked, keys)
+```bash
+python demo.py                 # synthetic cover
+python demo.py path/to.png     # arbitrary grayscale image
 ```
 
-### Modified RRWEI-SM API
+Prints PSNR/SSIM, robust BER, PVO payload bits-per-pixel, and writes a
+side-by-side PNG to `figures/out/demo_cover_marked.png`.
 
-```python
-from rrwei_sm import ModifiedRRWEISM
+### `evaluate.py` -- reproducibility harness
 
-scheme = ModifiedRRWEISM(
-    n_lsb=3,
-    patchwork_m=64,
-    patchwork_T=5,
-    patchwork_plane="hsb",        # paper's mode
-    compress_side_info=True,      # zlib-compress patchwork side info
-    scrambler="hua",
-    n_parties=2,
-)
-
-s1, s2, keys = scheme.encrypt(cover, key_scramble=1, key_share=2)
-ms1, ms2, side = scheme.embed(s1, s2, robust_bits)
-
-# Quick robust path (survives mild attacks, no exact recovery needed)
-bits = scheme.extract_robust_after_decrypt(ms1, ms2, keys, side)
-
-# Full path: exact cover recovery + robust bits (requires intact image)
-cover_back, bits = scheme.extract_and_recover_after_decrypt(ms1, ms2, keys, side)
+```bash
+python evaluate.py --size 128
 ```
 
-## Reproducing paper results
+Runs the full pipeline on synthetic Lena/Baboon/Peppers-like covers and
+prints PSNR, SSIM, PEE capacity, pixel correlation, NPCR/UACI, and
+robustness BER against every attack primitive in `rrwei_sm.attacks`.
 
-The `evaluate.py` script runs the end-to-end pipeline on synthetic
-Lena/Baboon/Peppers-like covers and prints PSNR, SSIM, PEE capacity,
-pixel correlation, NPCR/UACI, and robustness BER against every attack
-primitive. Example (96x96 covers, 32 robust bits):
+### `real_image_harness.py` -- canonical real-image acceptance suite
 
-```
-==== lena_like ====
-  share/cover correlation    : +0.003  (ideal: 0)
-  combined corr (H/V/D)      : +0.51 / +0.51 / +0.24
-  PSNR(cover, marked)        : 39.4 dB
-  SSIM(cover, marked)        : 0.998
-  PEE capacity (bpp)         : 0.133
-  Exact recovery             : True
-  BER @ Gaussian sigma=10    : 0.000
-  BER @ JPEG q=50            : 0.000
-  BER @ JPEG2000 r=20        : 0.000
-  BER median/mean/sharpen/SP : 0.100 / 0.000 / 0.000 / 0.000
+```bash
+python real_image_harness.py
 ```
 
-`benchmark.py` confirms **O(n)** complexity for all three operations
-(encrypt / decrypt / embed) across image sizes; the per-pixel time is
-roughly constant within 2x.
+Downloads (and caches under `assets/test_images/`) Lena, Baboon and
+Peppers from a public mirror, runs the modernized pipeline on each, and
+**enforces acceptance thresholds** (PSNR >= 38 dB, SSIM >= 0.97,
+exact reversible recovery, BER == 0 under Gaussian sigma=10 and JPEG
+q=40). Exits non-zero if any threshold fails. Also emits
+`figures/out/real_images.png`.
 
-`figures/make_all.py` generates five PNGs in `figures/out/`:
+### `run_custom_image.py` -- run the pipeline on your own image
 
-* `wgn_ber.png`            -- 1-BER vs. Gaussian noise sigma
-* `jpeg_ber.png`           -- 1-BER vs. JPEG quality factor
-* `capacity_psnr.png`      -- PSNR vs. embedding capacity tradeoff
-* `benchmark_on.png`       -- per-pixel timing vs. image size (O(n) check)
-* `encrypted_visuals.png`  -- cover / share / combined encrypted image + histograms
+```bash
+python run_custom_image.py path/to/image.png
+python run_custom_image.py path/to/image.jpg --size 512
+```
+
+Loads an arbitrary image, converts to 8-bit grayscale, center-crops to
+the largest square that is a multiple of 8, runs the full pipeline, and
+saves into `figures/out/<stem>_artifacts/`:
+
+```
+<stem>__01_cover.png                       # preprocessed cover
+<stem>__02_scrambled.png                   # ChaCha20 block scramble
+<stem>__03_marked.png                      # after STDM + PVO embedding
+<stem>__04_attacked_gaussian_s10.png       # AWGN sigma=10 attack
+<stem>__05_attacked_jpeg_q40.png           # JPEG q=40 attack
+<stem>__06_diff_abs_x25.png                # |cover - marked| * 25
+```
+
+Plus a 3-panel summary at `figures/out/custom_image.png`.
+Metrics are echoed to stdout.
+
+### `benchmark_modern.py` -- runtime harness
+
+```bash
+python benchmark_modern.py --sizes 64 128 256 512 --n-repeats 3
+```
+
+Measures per-pixel wall time for encrypt, decrypt, STDM embed, PVO
+embed, and reports the **Numba speedup** of PVO vs. a pure-Python
+reference. `benchmark.py` is a thin compatibility shim around this.
+
+### `figures/make_*.py` -- individual plot generators
+
+Each file regenerates one PNG under `figures/out/`:
+
+| Script                              | Output                  | What it shows                                 |
+|-------------------------------------|-------------------------|-----------------------------------------------|
+| `figures/make_wgn_ber.py`           | `wgn_ber.png`           | 1-BER vs. Gaussian noise sigma                |
+| `figures/make_jpeg_ber.py`          | `jpeg_ber.png`          | 1-BER vs. JPEG quality                        |
+| `figures/make_robustness_sweep.py`  | `robustness_sweep.png`  | BER across the full modern attack suite       |
+| `figures/make_capacity.py`          | `capacity_psnr.png`     | PVO capacity vs. PSNR tradeoff                |
+| `figures/make_benchmark.py`         | `benchmark_on.png`      | per-pixel time vs. image size (O(n) check)    |
+| `figures/make_pvo_speedup.py`       | `pvo_speedup.png`       | Numba JIT vs. pure-Python PVO                 |
+| `figures/make_encrypted_visuals.py` | `encrypted_visuals.png` | cover/share/combined + histograms             |
+| `figures/make_quality_summary.py`   | `quality_summary.png`   | PSNR/SSIM/DISTS/LPIPS on Lena/Baboon/Peppers  |
+
+Regenerate everything at once:
+
+```bash
+python -m figures.make_all
+```
+
+All scripted PNGs are committed so `FIGURES.md` renders on GitHub. Only
+user-specific outputs (`custom_image.png`, `*_artifacts/`) are
+gitignored.
 
 ## Tests
 
 ```
 tests/
-├── test_secret_sharing.py           # Eqs. 7-14, carry invariants
-├── test_scrambling.py               # random permutation round-trip
-├── test_hua_scrambling.py           # 2D-LSCM scrambling
-├── test_pee.py                      # Eqs. 15-22 + SMC contribution additivity
-├── test_patchwork.py                # Eqs. 23-27
-├── test_rrwei_sm.py                 # basic scheme, both extraction orders
-├── test_modified_rrwei_sm.py        # two-stage scheme round-trip + capacity error
-├── test_hsb_patchwork_and_compression.py   # HSB-plane patchwork + zlib side info
-├── test_multiparty.py               # k-party additive sharing & k-party RRWEI-SM
-├── test_metrics.py                  # NPCR, UACI, correlation, Eq. 28
-├── test_attacks.py                  # Gaussian, S&P, median, mean, sharpen, JPEG, JPEG2000
-├── test_robustness.py               # legacy noise-robustness
-├── test_robustness_attacks.py       # Modified RRWEI-SM robustness under every attack
-├── test_datasets.py                 # synthetic classic covers
-└── test_utils.py                    # metric helpers
+├── test_crypto_scrambler.py   # ChaCha20 scramble round-trip + diffusion
+├── test_threshold_sharing.py  # (k, n) replicated shares
+├── test_stdm.py               # STDM embed/extract under perturbation
+├── test_coding.py             # rANS round-trip
+├── test_pvo.py                # PVO+PEE reversibility + capacity
+├── test_metrics.py            # PSNR, SSIM, LPIPS, DISTS-proxy, NPCR/UACI
+├── test_attacks.py            # classical + neural/SR/diffusion proxies
+├── test_secret_sharing.py     # legacy additive share (kept for ablation)
+└── test_orchestrator.py       # ModernScheme end-to-end round-trip
 ```
 
-96 tests, full suite runs in under a second.
+Run with `pytest tests/ -q`.
 
 ## Known limitations
 
-See [LIMITATIONS.md](LIMITATIONS.md) for the full list. The remaining
-documented deviations after this round:
+See [`LIMITATIONS.md`](LIMITATIONS.md) for the full list. Highlights:
 
-1. **NPCR protocol ambiguity**: the paper reports NPCR ~99% for 2x2
-   scrambling, whereas our same-key NPCR is effectively `1/n` because
-   additive sharing + a permutation is not diffusing. We implement and
-   expose the metric; the paper's published value appears to derive from
-   *random-key* NPCR (different shares/scramble key per sample) -- see
-   `rrwei_sm/metrics.py` docstring.
-2. **SMC security proofs** (Theorem 1) are not cryptographically
-   reproduced; only the numerical invariants used in the simulator
-   argument are self-checked.
-3. Classic test images are synthetic Lena/Baboon/Peppers stand-ins
-   (generated from gradients + textures) so the repo has no image
-   redistribution footprint.
+1. Neural / SR / diffusion attack stages are deterministic CPU-side
+   *proxies*, not the actual published models. They match the
+   qualitative shape of each attack but underestimate worst-case drift
+   in any given deployment.
+2. The canonical Lena/Baboon/Peppers images are downloaded from a
+   public mirror by `real_image_harness.py`; if that mirror is down the
+   harness falls back to the synthetic covers in `datasets/`.
+3. LPIPS requires `torch` + the `lpips` package. When unavailable,
+   `rrwei_sm.metrics.lpips_distance` returns `None` and
+   `make_quality_summary.py` degrades gracefully.
