@@ -56,6 +56,30 @@ def _ber(a: np.ndarray, b: np.ndarray) -> float:
     return float((a[:n] != b[:n]).mean())
 
 
+def _save_panel(cover: np.ndarray, marked: np.ndarray, out_path: Path) -> None:
+    """Write a cover / marked / |diff|*25 triptych PNG."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    diff = np.abs(cover.astype(np.int16) - marked.astype(np.int16)).clip(0, 10) * 25
+    fig, axes = plt.subplots(1, 3, figsize=(9.0, 3.2))
+    for ax, img, title in zip(
+        axes,
+        (cover, marked.astype(np.uint8), diff.astype(np.uint8)),
+        ("cover", "marked", "|cover - marked| x25"),
+    ):
+        ax.imshow(img, cmap="gray", vmin=0, vmax=255)
+        ax.set_title(title)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
 def main() -> int:
     cover = _load_or_make_cover(sys.argv)
     print(f"Cover shape: {cover.shape}, min/max: {cover.min()}/{cover.max()}")
@@ -91,6 +115,10 @@ def main() -> int:
     )
     first_mask = next(iter(shares.masks.values()))
     print(f"  Corr(mask_0, cover)      : {_correlation(first_mask, cover):+.3f}")
+
+    out_path = Path("figures/out/demo_cover_marked.png")
+    _save_panel(cover, marked, out_path)
+    print(f"  panel written to         : {out_path}")
     print("Done.")
     return 0
 
