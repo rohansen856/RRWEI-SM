@@ -23,8 +23,10 @@ htmlcov/
 Thumbs.db
 *.swp
 
-# Local outputs
-figures/out/
+# Local scratch / user-specific outputs (scripted figures ARE tracked;
+# per-user artifacts from run_custom_image.py are not).
+figures/out/custom_image.png
+figures/out/*_artifacts/
 *.pkl
 
 # Downloaded real-image cache
