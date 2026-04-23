@@ -135,17 +135,31 @@ def main() -> int:
     axes[0, 0].set_title(f"cover\n{cover.shape[0]}x{cover.shape[1]}")
     axes[0, 1].imshow(marked, cmap="gray", vmin=0, vmax=255)
     axes[0, 1].set_title(f"marked\nPSNR={psnr_db:.2f} dB, SSIM={ssim_val:.4f}")
-    diff = np.abs(cover.astype(int) - marked.astype(int)).clip(0, 10) * 25
-    axes[0, 2].imshow(diff.astype(np.uint8), cmap="gray", vmin=0, vmax=255)
-    axes[0, 2].set_title("|cover - marked| x25")
+    axes[0, 2].imshow(wm * 255, cmap="gray", vmin=0, vmax=255)
+    axes[0, 2].set_title(f"watermark (input)\n{wm_h}x{wm_w} ({bits.size} bits)")
 
-    axes[1, 0].imshow(wm * 255, cmap="gray", vmin=0, vmax=255)
-    axes[1, 0].set_title(f"watermark\n{wm_h}x{wm_w} ({bits.size} bits)")
-    axes[1, 1].imshow(ext_clean.reshape(wm_h, wm_w) * 255, cmap="gray", vmin=0, vmax=255)
-    axes[1, 1].set_title(f"recovered, clean\nBER={ber_clean:.3f}")
-    ext_j40 = scheme.extract_robust(attacks["jpeg_q40"], res.stdm_side, scramble_seed=11)
-    axes[1, 2].imshow(ext_j40.reshape(wm_h, wm_w) * 255, cmap="gray", vmin=0, vmax=255)
-    axes[1, 2].set_title(f"recovered, JPEG q=40\nBER={bers['jpeg_q40']:.3f}")
+    axes[1, 0].imshow(
+        ext_clean.reshape(wm_h, wm_w) * 255, cmap="gray", vmin=0, vmax=255
+    )
+    axes[1, 0].set_title(f"recovered, clean\nBER={ber_clean:.3f}")
+    ext_g10 = scheme.extract_robust(
+        attacks["gaussian_s10"], res.stdm_side, scramble_seed=11
+    )
+    axes[1, 1].imshow(
+        ext_g10.reshape(wm_h, wm_w) * 255, cmap="gray", vmin=0, vmax=255
+    )
+    axes[1, 1].set_title(
+        f"recovered, Gaussian sigma=10\nBER={bers['gaussian_s10']:.3f}"
+    )
+    ext_j40 = scheme.extract_robust(
+        attacks["jpeg_q40"], res.stdm_side, scramble_seed=11
+    )
+    axes[1, 2].imshow(
+        ext_j40.reshape(wm_h, wm_w) * 255, cmap="gray", vmin=0, vmax=255
+    )
+    axes[1, 2].set_title(
+        f"recovered, JPEG q=40\nBER={bers['jpeg_q40']:.3f}"
+    )
 
     for ax in axes.flat:
         ax.set_xticks([])
