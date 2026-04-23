@@ -169,14 +169,65 @@ def _ber(a: np.ndarray, b: np.ndarray) -> float:
     return 0.0 if n == 0 else float((a[:n] != b[:n]).mean())
 
 
-def run_pipeline(cover: np.ndarray, *, n_robust: int, payload_bits: int) -> dict:
+def pick_watermark_shape(
+    cover_hw: tuple[int, int],
+    native_wh: tuple[int, int],
+    *,
+    budget_frac: float = 0.9,
+) -> tuple[int, int]:
+    """Pick (h, w) for the watermark thumbnail such that h*w fits in
+    ``budget_frac`` * (number of 8x8 STDM blocks in the cover) and the
+    aspect ratio is as close as possible to the native watermark."""
+    n_blocks = (cover_hw[0] // 8) * (cover_hw[1] // 8)
+    budget = int(n_blocks * budget_frac)
+    native_w, native_h = native_wh
+    ratio = native_w / max(native_h, 1)
+    h = max(8, int(round(np.sqrt(budget / max(ratio, 1e-6)))))
+    w = int(round(h * ratio))
+    while h * w > budget and (h > 1 or w > 1):
+        if w >= h:
+            w -= 1
+        else:
+            h -= 1
+    return h, w
+
+
+def load_watermark_bits(
+    wm_path: Path,
+    cover_hw: tuple[int, int],
+    *,
+    budget_frac: float = 0.9,
+) -> tuple[np.ndarray, tuple[int, int]]:
+    """Load ``wm_path``, binarise (mean threshold), downsample to fit
+    the cover's STDM budget, and return (bits, (wm_h, wm_w))."""
+    from PIL import Image
+
+    img = Image.open(wm_path)
+    wm_h, wm_w = pick_watermark_shape(cover_hw, img.size)
+    gray = img.convert("L").resize((wm_w, wm_h), Image.LANCZOS)
+    arr = np.asarray(gray, dtype=np.uint8)
+    bits = (arr < arr.mean()).astype(np.uint8).flatten()
+    return bits, (wm_h, wm_w)
+
+
+def run_pipeline(
+    cover: np.ndarray,
+    *,
+    n_robust: int,
+    payload_bits: int,
+    robust_bits: np.ndarray | None = None,
+    watermark_shape: tuple[int, int] | None = None,
+) -> dict:
     from rrwei_sm import ModernScheme
     from rrwei_sm.attacks import gaussian_noise, jpeg_compress
     from rrwei_sm.metrics import dists_proxy, psnr, ssim
 
     scheme = ModernScheme(k=2, n=3)
     rng = np.random.default_rng(0)
-    robust_bits = rng.integers(0, 2, size=n_robust, dtype=np.uint8)
+    if robust_bits is None:
+        robust_bits = rng.integers(0, 2, size=n_robust, dtype=np.uint8)
+    else:
+        robust_bits = robust_bits.astype(np.uint8, copy=False)
     payload = rng.integers(0, 2, size=payload_bits, dtype=np.uint8)
     result = scheme.embed(cover, robust_bits, payload, scramble_seed=11)
     marked = result.marked_cover
@@ -195,7 +246,7 @@ def run_pipeline(cover: np.ndarray, *, n_robust: int, payload_bits: int) -> dict
     return {
         "cover_sha1": hashlib.sha1(cover.tobytes()).hexdigest()[:12],
         "shape": list(cover.shape),
-        "n_robust_bits": int(n_robust),
+        "n_robust_bits": int(robust_bits.size),
         "n_reversible_bits": int(result.n_reversible_bits),
         "reversible_bpp": float(result.n_reversible_bits / cover.size),
         "psnr_db": psnr(cover, marked),
@@ -208,6 +259,9 @@ def run_pipeline(cover: np.ndarray, *, n_robust: int, payload_bits: int) -> dict
             np.array_equal(ext_payload, payload[: ext_payload.size])
         ),
         "marked": marked,
+        "robust_bits": robust_bits,
+        "ext_clean_bits": ext_clean,
+        "watermark_shape": watermark_shape,
     }
 
 
@@ -258,20 +312,30 @@ def save_panel(results: dict[str, dict], out_path: Path) -> None:
         r = results[name]
         cover = r["_cover"]
         marked = r["marked"]
-        diff = np.abs(cover.astype(np.int32) - marked.astype(np.int32)).astype(
-            np.uint8
-        )
         axs[row, 0].imshow(cover, cmap="gray", vmin=0, vmax=255)
         axs[row, 0].set_title(f"{name} cover")
         axs[row, 1].imshow(marked, cmap="gray", vmin=0, vmax=255)
         axs[row, 1].set_title(
             f"{name} marked\nPSNR={r['psnr_db']:.1f} SSIM={r['ssim']:.3f}"
         )
-        axs[row, 2].imshow(diff, cmap="inferno", vmin=0, vmax=10)
-        axs[row, 2].set_title(
-            f"|cover - marked| (clip to 10)\n"
-            f"BER g10={r['ber_gaussian_sigma10']:.2f} jpegQ40={r['ber_jpeg_q40']:.2f}"
-        )
+        if r.get("watermark_shape") is not None and r.get("ext_clean_bits") is not None:
+            wm_h, wm_w = r["watermark_shape"]
+            extracted = (r["ext_clean_bits"][: wm_h * wm_w]
+                         .reshape(wm_h, wm_w) * 255).astype(np.uint8)
+            axs[row, 2].imshow(extracted, cmap="gray", vmin=0, vmax=255)
+            axs[row, 2].set_title(
+                f"extracted watermark\n"
+                f"BER clean={r['ber_clean']:.3f} jpegQ40={r['ber_jpeg_q40']:.3f}"
+            )
+        else:
+            diff = np.abs(
+                cover.astype(np.int32) - marked.astype(np.int32)
+            ).astype(np.uint8)
+            axs[row, 2].imshow(diff, cmap="inferno", vmin=0, vmax=10)
+            axs[row, 2].set_title(
+                f"|cover - marked| (clip to 10)\n"
+                f"BER g10={r['ber_gaussian_sigma10']:.2f} jpegQ40={r['ber_jpeg_q40']:.2f}"
+            )
         for c in range(3):
             axs[row, c].axis("off")
     fig.tight_layout()
@@ -296,8 +360,23 @@ def main() -> int:
         "--no-fallback", action="store_true",
         help="Do not fall back to synthetic covers if the download fails.",
     )
+    ap.add_argument(
+        "--watermark", type=str, default="watermark.png",
+        help=("Path to a watermark image to embed and visualise in the "
+              "third panel. Set to '' or 'none' to fall back to the "
+              "random-bits diff-map panel."),
+    )
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
+
+    wm_path = None
+    if args.watermark and args.watermark.lower() != "none":
+        p = Path(args.watermark)
+        if p.exists():
+            wm_path = p
+        else:
+            print(f"  ! watermark file not found: {p}, falling back to random bits",
+                  file=sys.stderr)
 
     all_results: dict[str, dict] = {}
     any_failed = False
@@ -309,8 +388,15 @@ def main() -> int:
         print(f"  source              : {source}")
         print(f"  shape               : {cover.shape}")
         n_robust = min(args.n_robust, (cover.shape[0] // 8) * (cover.shape[1] // 8))
+        robust_bits = None
+        wm_shape = None
+        if wm_path is not None:
+            robust_bits, wm_shape = load_watermark_bits(wm_path, cover.shape)
+            n_robust = int(robust_bits.size)
+            print(f"  watermark           : {wm_path} -> {wm_shape} ({n_robust} bits)")
         res = run_pipeline(
-            cover, n_robust=n_robust, payload_bits=args.payload_bits
+            cover, n_robust=n_robust, payload_bits=args.payload_bits,
+            robust_bits=robust_bits, watermark_shape=wm_shape,
         )
         res["_cover"] = cover
         res["source"] = source

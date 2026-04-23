@@ -21,7 +21,12 @@ from pathlib import Path
 
 import numpy as np
 
-from real_image_harness import check_acceptance, run_pipeline, save_panel
+from real_image_harness import (
+    check_acceptance,
+    load_watermark_bits,
+    run_pipeline,
+    save_panel,
+)
 
 
 def save_artifacts(
@@ -93,6 +98,11 @@ def main() -> int:
     ap.add_argument(
         "--panel", type=str, default="figures/out/custom_image.png"
     )
+    ap.add_argument(
+        "--watermark", type=str, default="watermark.png",
+        help=("Path to a watermark image to embed and visualise. Set to "
+              "'' or 'none' to use random bits + diff-map panel."),
+    )
     args = ap.parse_args()
 
     path = Path(args.image)
@@ -105,9 +115,25 @@ def main() -> int:
     print(f"input               : {path.name}")
     print(f"processed shape     : {cover.shape} (grayscale, multiple of 8)")
 
+    wm_path = None
+    if args.watermark and args.watermark.lower() != "none":
+        wm_candidate = Path(args.watermark)
+        if wm_candidate.exists():
+            wm_path = wm_candidate
+
+    robust_bits = None
+    wm_shape = None
     n_robust = min(args.n_robust, (cover.shape[0] // 8) * (cover.shape[1] // 8))
+    if wm_path is not None:
+        robust_bits, wm_shape = load_watermark_bits(wm_path, cover.shape)
+        n_robust = int(robust_bits.size)
+        print(f"watermark           : {wm_path} -> {wm_shape} ({n_robust} bits)")
+    else:
+        print("watermark           : (none, using random bits)")
+
     res = run_pipeline(
-        cover, n_robust=n_robust, payload_bits=args.payload_bits
+        cover, n_robust=n_robust, payload_bits=args.payload_bits,
+        robust_bits=robust_bits, watermark_shape=wm_shape,
     )
     res["_cover"] = cover
     res["source"] = str(path)

@@ -27,6 +27,11 @@ from rrwei_sm import ModernScheme
 from rrwei_sm.attacks import gaussian_noise
 from rrwei_sm.metrics import psnr, ssim
 
+try:
+    from real_image_harness import load_watermark_bits
+except Exception:  # pragma: no cover
+    load_watermark_bits = None
+
 
 def _load_or_make_cover(argv: list[str]) -> np.ndarray:
     if len(argv) > 1:
@@ -56,22 +61,38 @@ def _ber(a: np.ndarray, b: np.ndarray) -> float:
     return float((a[:n] != b[:n]).mean())
 
 
-def _save_panel(cover: np.ndarray, marked: np.ndarray, out_path: Path) -> None:
-    """Write a cover / marked / |diff|*25 triptych PNG."""
+def _save_panel(
+    cover: np.ndarray,
+    marked: np.ndarray,
+    out_path: Path,
+    *,
+    extracted_watermark: np.ndarray | None = None,
+    ber_clean: float | None = None,
+) -> None:
+    """Write a cover / marked / (extracted watermark | |diff|*25) triptych."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    diff = np.abs(cover.astype(np.int16) - marked.astype(np.int16)).clip(0, 10) * 25
     fig, axes = plt.subplots(1, 3, figsize=(9.0, 3.2))
-    for ax, img, title in zip(
-        axes,
-        (cover, marked.astype(np.uint8), diff.astype(np.uint8)),
-        ("cover", "marked", "|cover - marked| x25"),
-    ):
-        ax.imshow(img, cmap="gray", vmin=0, vmax=255)
-        ax.set_title(title)
+    axes[0].imshow(cover, cmap="gray", vmin=0, vmax=255)
+    axes[0].set_title("cover")
+    axes[1].imshow(marked.astype(np.uint8), cmap="gray", vmin=0, vmax=255)
+    axes[1].set_title("marked")
+    if extracted_watermark is not None:
+        axes[2].imshow(extracted_watermark, cmap="gray", vmin=0, vmax=255)
+        title = "extracted watermark"
+        if ber_clean is not None:
+            title += f"\nBER clean={ber_clean:.3f}"
+        axes[2].set_title(title)
+    else:
+        diff = (
+            np.abs(cover.astype(np.int16) - marked.astype(np.int16)).clip(0, 10) * 25
+        )
+        axes[2].imshow(diff.astype(np.uint8), cmap="gray", vmin=0, vmax=255)
+        axes[2].set_title("|cover - marked| x25")
+    for ax in axes:
         ax.set_xticks([])
         ax.set_yticks([])
     fig.tight_layout()
@@ -85,9 +106,20 @@ def main() -> int:
     print(f"Cover shape: {cover.shape}, min/max: {cover.min()}/{cover.max()}")
 
     scheme = ModernScheme(k=2, n=3)
-    n_robust = min(128, (cover.shape[0] // 8) * (cover.shape[1] // 8))
     rng = np.random.default_rng(0)
-    robust_bits = rng.integers(0, 2, size=n_robust, dtype=np.uint8)
+
+    wm_path = Path("watermark.png")
+    wm_shape: tuple[int, int] | None = None
+    if wm_path.exists() and load_watermark_bits is not None:
+        robust_bits, wm_shape = load_watermark_bits(wm_path, cover.shape)
+        print(
+            f"Watermark: {wm_path} -> {wm_shape} ({robust_bits.size} bits)"
+        )
+    else:
+        n_robust = min(128, (cover.shape[0] // 8) * (cover.shape[1] // 8))
+        robust_bits = rng.integers(0, 2, size=n_robust, dtype=np.uint8)
+        print(f"Watermark: random bits ({n_robust})")
+
     reversible_payload = rng.integers(0, 2, size=512, dtype=np.uint8)
 
     scrambled, shares = scheme.encrypt(cover, scramble_seed=11, share_seed=22)
@@ -102,12 +134,13 @@ def main() -> int:
     attacked = gaussian_noise(marked, sigma=3.0, seed=1)
     ext_noisy = scheme.extract_robust(attacked, result.stdm_side, scramble_seed=11)
 
+    ber_clean = _ber(ext_clean, robust_bits)
     print("\n== Modern pipeline ==")
-    print(f"  robust bits              : {n_robust}")
+    print(f"  robust bits              : {robust_bits.size}")
     print(f"  reversible bits embedded : {result.n_reversible_bits}")
     print(f"  PSNR(cover, marked)      : {psnr(cover, marked):.2f} dB")
     print(f"  SSIM(cover, marked)      : {ssim(cover, marked):.4f}")
-    print(f"  BER (clean extract)      : {_ber(ext_clean, robust_bits):.4f}")
+    print(f"  BER (clean extract)      : {ber_clean:.4f}")
     print(f"  BER (sigma=3 noise)      : {_ber(ext_noisy, robust_bits):.4f}")
     print(
         "  payload recovered exactly:"
@@ -116,8 +149,16 @@ def main() -> int:
     first_mask = next(iter(shares.masks.values()))
     print(f"  Corr(mask_0, cover)      : {_correlation(first_mask, cover):+.3f}")
 
+    extracted_img: np.ndarray | None = None
+    if wm_shape is not None:
+        wh, ww = wm_shape
+        extracted_img = (
+            ext_clean[: wh * ww].reshape(wh, ww) * 255
+        ).astype(np.uint8)
+
     out_path = Path("figures/out/demo_cover_marked.png")
-    _save_panel(cover, marked, out_path)
+    _save_panel(cover, marked, out_path,
+                extracted_watermark=extracted_img, ber_clean=ber_clean)
     print(f"  panel written to         : {out_path}")
     print("Done.")
     return 0
