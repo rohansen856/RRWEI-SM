@@ -61,6 +61,33 @@ def _ber(a: np.ndarray, b: np.ndarray) -> float:
     return float((a[:n] != b[:n]).mean())
 
 
+def _ncc(orig: np.ndarray, ext: np.ndarray) -> float:
+    """Normalised cross-correlation between the embedded watermark bits
+    and the extracted bits (standard watermarking metric; NCC=1.0 means
+    a perfect match)."""
+    n = min(orig.size, ext.size)
+    o = orig[:n].astype(np.float64)
+    e = ext[:n].astype(np.float64)
+    denom = float(np.sqrt((o * o).sum() * (e * e).sum()))
+    if denom == 0.0:
+        return 0.0
+    return float((o * e).sum() / denom)
+
+
+def _psnr_bits(orig: np.ndarray, ext: np.ndarray) -> float:
+    """PSNR between two binary bit arrays, treating them as 8-bit images
+    in {0, 255}.  Returns +inf when BER is 0 (identical arrays)."""
+    n = min(orig.size, ext.size)
+    if n == 0:
+        return float("inf")
+    o = orig[:n].astype(np.float64) * 255.0
+    e = ext[:n].astype(np.float64) * 255.0
+    mse = float(((o - e) ** 2).mean())
+    if mse == 0.0:
+        return float("inf")
+    return float(10.0 * np.log10((255.0 ** 2) / mse))
+
+
 def _save_panel(
     cover: np.ndarray,
     marked: np.ndarray,
@@ -138,10 +165,22 @@ def main() -> int:
     print("\n== Modern pipeline ==")
     print(f"  robust bits              : {robust_bits.size}")
     print(f"  reversible bits embedded : {result.n_reversible_bits}")
-    print(f"  PSNR(cover, marked)      : {psnr(cover, marked):.2f} dB")
+    print("\n  -- imperceptibility (cover vs. marked image) --")
+    print(f"  PSNR(cover, marked)      : {psnr(cover, marked):.2f} dB   "
+          "(not infinite: STDM is lossy by design)")
     print(f"  SSIM(cover, marked)      : {ssim(cover, marked):.4f}")
-    print(f"  BER (clean extract)      : {ber_clean:.4f}")
+    print("\n  -- watermark recovery (embedded bits vs. extracted bits) --")
+    print(f"  BER (clean extract)      : {ber_clean:.4f}   "
+          "(0.0 = every bit recovered)")
     print(f"  BER (sigma=3 noise)      : {_ber(ext_noisy, robust_bits):.4f}")
+    ncc_clean = _ncc(robust_bits, ext_clean)
+    psnr_wm_clean = _psnr_bits(robust_bits, ext_clean)
+    psnr_wm_str = "inf" if psnr_wm_clean == float("inf") else f"{psnr_wm_clean:.2f} dB"
+    print(f"  NCC (watermark_in, out)  : {ncc_clean:.6f}   "
+          "(1.0 = bit-for-bit identical)")
+    print(f"  PSNR(watermark_in, out)  : {psnr_wm_str}   "
+          "(infinite when BER=0)")
+    print("\n  -- reversible payload --")
     print(
         "  payload recovered exactly:"
         f" {bool(np.array_equal(ext_payload, reversible_payload[: ext_payload.size]))}"
