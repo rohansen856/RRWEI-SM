@@ -49,7 +49,14 @@ def load_gray_square(path: Path, block: int = 8) -> np.ndarray:
 
 def load_binary_watermark(path: Path, size_hw: tuple[int, int]) -> np.ndarray:
     h, w = size_hw
-    img = Image.open(path).convert("L").resize((w, h), Image.LANCZOS)
+    img = Image.open(path)
+    if img.mode in ("RGBA", "LA") or (
+        img.mode == "P" and "transparency" in img.info
+    ):
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(bg, rgba).convert("RGB")
+    img = img.convert("L").resize((w, h), Image.LANCZOS)
     a = np.asarray(img, dtype=np.uint8)
     return (a < a.mean()).astype(np.uint8)
 

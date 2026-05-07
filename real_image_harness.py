@@ -199,10 +199,19 @@ def load_watermark_bits(
     budget_frac: float = 0.9,
 ) -> tuple[np.ndarray, tuple[int, int]]:
     """Load ``wm_path``, binarise (mean threshold), downsample to fit
-    the cover's STDM budget, and return (bits, (wm_h, wm_w))."""
+    the cover's STDM budget, and return (bits, (wm_h, wm_w)).
+
+    RGBA inputs are composited onto a white background first so
+    transparent pixels become bright (255) instead of black (0); this
+    keeps the mean threshold meaningful on logos with alpha channels.
+    """
     from PIL import Image
 
     img = Image.open(wm_path)
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(bg, rgba).convert("RGB")
     wm_h, wm_w = pick_watermark_shape(cover_hw, img.size)
     gray = img.convert("L").resize((wm_w, wm_h), Image.LANCZOS)
     arr = np.asarray(gray, dtype=np.uint8)
